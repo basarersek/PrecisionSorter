@@ -130,19 +130,49 @@ Server owner assigns these to groups. Nothing is free unless the owner grants it
 
 ## 12. Config (owner-facing)
 
-Allowed container prefabs, nearby radius, require building privilege, respect NoEscape, include hotbar, sorts per minute,
-UI theme and placement, action logging on/off. All with sane defaults so a fresh install works untouched.
+Every option has a sane default, so a fresh install works untouched. The file is rewritten on load,
+so options added in a later version appear without wiping the owner's file.
+
+- `AllowedContainers` - prefab shortnames that may carry a filter.
+- `ChatCommands` - chat aliases, default `ps`. Registered at load, so owners pick their own name.
+- `NearbyRadius`, `RequireBuildingPrivilege`, `RespectNoEscape`, `IncludeHotbar`, `SortsPerMinute`.
+- `LogActions` - writes a buffered audit file to `oxide/logs/PrecisionSorter/<date>.txt`.
+- `EnableHarness` - exposes the test harness. Default false, keep false on a live server.
+- `Ui` - anchor, panel offsets for both panels, and the eight palette colours.
+
+Known trap: Json.NET appends to a pre-filled collection instead of replacing it, so list defaults must
+stay empty in the class and be supplied by `PluginConfig.Default()`. Otherwise every load duplicates
+each entry.
 
 ## 13. Roadmap
 
-- P1 (toolchain proof): plugin loads on the dev server, catalog caches, panel opens on a valid box, permissions register. Done in this repo as a skeleton.
-- P2 (core): filter storage and identity, This + Arrange, data save/load and wipe reset.
-- P3 (full actions): Nearby, Dump All, Loot All, building-privilege and NoEscape gating, cooldowns.
-- P4 (UI): search field, category row, item grid, action bar, cursor handling.
-- P5 (harden): audit log, admin commands, load test at population, edge cases (broken items, full box, equipped items, stashes).
+- P1 (toolchain proof): DONE. Plugin loads, catalog caches 1259 items, permissions register.
+- P2 (core): DONE. Filter storage and box identity, This + Arrange, data save/load, wipe reset.
+- P3 (full actions): DONE. Nearby, Dump All, Loot All, building privilege, NoEscape gating, cooldown.
+- P4 (UI): DONE. Main panel, search field, category row, paged item grid, mode toggle, cursor and keyboard handling.
+- P5 (config + harden): DONE for config. Audit log, population load test and live-client edge cases remain.
 - P6 (Carbon port): re-test on Carbon after Oxide ships.
 
-## 14. Risks and open questions
+## 14. Testing phases
+
+- T0 compile and boot - automated. Plugin loads, catalog builds, no exceptions. PASSING.
+- T1 matcher truth table - automated. `ps.selftest` asserts the matcher and reports item and category drift
+  against the live DB. PASSING: 5 assertions plus 2 drift checks.
+- T2 item conservation - automated. `ps.harness run <n>` spawns real boxes, creates real items and runs
+  This, Dump and Arrange repeatedly, asserting item count, total stack amount, reference uniqueness and
+  capacity. PASSING: 300 iterations, 0 conservation failures, 0 duplicates, 0 capacity violations.
+- T3 persistence - automated. `ps.harness save` writes a filter, the server restarts, then
+  `ps.harness check` reads it back. PASSING.
+- T4 gating matrix - needs a client for the chat path. Permission, privilege, raid block and cooldown refusals.
+- T5 single client - manual. Panel scope, search field, cursor and keyboard, icon rendering, each action.
+- T6 concurrency - manual, two clients. Simultaneous sorts on one box, moves during a sort, adjacent boxes.
+- T7 load - timing a Nearby sort with many boxes, then a soak.
+- T8 update regression - re-run T0 to T3 after every Facepunch and Oxide update.
+
+100% is not attainable: Facepunch can change item data every month, and dupe or UI faults only appear
+with a real client. T2 and T3 are the mechanical guard; T5 and T6 are yours.
+
+## 15. Risks and open questions
 
 - CUI input fields behave differently across client resolutions; needs a real client test.
 - `IItemContainerEntity` and `MoveToContainer` signatures are confirmed by compile on the dev server, not yet by reflection (PS 5.1 cannot reflect default-interface types).

@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Converters;
@@ -10,29 +11,100 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("PrecisionSorter", "gringatestudios", "0.2.0")]
+    [Info("PrecisionSorter", "gringatestudios", "0.5.0")]
     [Description("Per-box item and category sorting with a searchable picker UI.")]
     public class PrecisionSorter : RustPlugin
     {
+        // ------------------------------------------------------------------ identity
+
         private const string UsePerm     = "precisionsorter.use";
         private const string NearbyPerm  = "precisionsorter.nearby";
         private const string DumpAllPerm = "precisionsorter.dumpall";
         private const string LootAllPerm = "precisionsorter.lootall";
         private const string ArrangePerm = "precisionsorter.arrange";
         private const string AdminPerm   = "precisionsorter.admin";
-        private const string PanelId     = "precisionsorter.panel";
-        private const string DataFile    = "PrecisionSorter/BoxFilters";
+
+        private const string PanelId  = "precisionsorter.panel";
+        private const string DataFile = "PrecisionSorter/BoxFilters";
+
+        private const string TestBoxPrefab = "assets/prefabs/deployable/woodenbox/woodbox_deployed.prefab";
+
+        // ------------------------------------------------------------------ ui palette
+
+        private string ColorPanel    => config.Ui.Colors.Panel;
+        private string ColorHeader   => config.Ui.Colors.Header;
+        private string ColorButton   => config.Ui.Colors.Button;
+        private string ColorAction   => config.Ui.Colors.Action;
+        private string ColorDanger   => config.Ui.Colors.Danger;
+        private string ColorMuted    => config.Ui.Colors.Muted;
+        private string ColorSelected => config.Ui.Colors.Selected;
+        private string ColorText     => config.Ui.Colors.Text;
+
+        private const int GridColumns = 6;
+        private const int GridRows    = 5;
+        private const int PageSize    = GridColumns * GridRows;
+        private const int MaxNameLength = 14;
+
+        // ------------------------------------------------------------------ game data
+
+        // Internal enum members that are not real item groups.
+        private static readonly string[] HiddenCategories = { "All", "Common", "Search", "Favourite" };
+
+        // Fixed positions let the harness prove filter persistence across a restart.
+        private static readonly Vector3 HarnessSourcePos = new Vector3(0f, 200f, 0f);
+        private static readonly Vector3 HarnessTargetPos = new Vector3(4f, 200f, 0f);
+
+        private static readonly string[] HarnessItems =
+        {
+            "wood", "stone", "metal.fragments", "scrap", "cloth", "lowgrade",
+            "rifle.ak", "ammo.rifle", "ammo.rocket.basic", "syringe.medical", "bandage", "sewingkit"
+        };
+
+        // NoEscape and Raid Block expose different names across versions; any true blocks.
+        private static readonly string[] RaidBlockHooks =
+        {
+            "API_IsRaidBlocked", "IsRaidBlocked", "API_IsEscapeBlocked", "IsEscapeBlocked"
+        };
+
+        private static readonly string[] CategoryNames = Enum.GetNames(typeof(ItemCategory))
+            .Where(name => !HiddenCategories.Contains(name))
+            .ToArray();
+
+        // ------------------------------------------------------------------ state
 
         private PluginConfig config;
         private SorterData data;
 
         private readonly List<ItemDefinition> catalog = new List<ItemDefinition>();
         private readonly Dictionary<string, ItemDefinition> byShortname = new Dictionary<string, ItemDefinition>(StringComparer.OrdinalIgnoreCase);
-        private readonly Dictionary<ulong, BaseEntity> openBox = new Dictionary<ulong, BaseEntity>();
-        private readonly HashSet<ulong> busy = new HashSet<ulong>();
+        private readonly Dictionary<ulong, Session> sessions = new Dictionary<ulong, Session>();
+        private readonly List<string> auditBuffer = new List<string>();
 
         private bool dataDirty;
         private bool saveScheduled;
+        private bool auditScheduled;
+
+        // Per-player UI and rate-limit state, dropped when the player leaves.
+        private class Session
+        {
+            public BaseEntity Box;
+            public string Search;
+            public int Page;
+            public bool PickerOpen;
+            public bool Busy;
+            public string CachedQuery;
+            public List<ItemDefinition> CachedItems;
+            public readonly List<float> SortTimes = new List<float>();
+        }
+
+        // A box the nearby sort may use, with its filter resolved once.
+        private class SortTarget
+        {
+            public ItemContainer Container;
+            public BoxFilter Filter;
+        }
+
+        // ------------------------------------------------------------------ lifecycle
 
         protected override void LoadDefaultConfig() => Config.WriteObject(PluginConfig.Default(), true);
 
@@ -40,7 +112,22 @@ namespace Oxide.Plugins
         {
             LoadConfig();
             RegisterPermissions();
+            RegisterChatCommands();
             LoadData();
+        }
+
+        // Aliases come from the config, so owners can pick the command name they want.
+        private void RegisterChatCommands()
+        {
+            var aliases = config.ChatCommands
+                .Where(alias => !string.IsNullOrWhiteSpace(alias))
+                .Select(alias => alias.Trim().ToLowerInvariant())
+                .Distinct();
+
+            foreach (var alias in aliases)
+            {
+                cmd.AddChatCommand(alias, this, CmdChat);
+            }
         }
 
         // ItemManager.itemList is empty during Init, so the catalog waits for server init.
@@ -55,6 +142,8 @@ namespace Oxide.Plugins
 
         private void OnServerSave()
         {
+            FlushAudit();
+
             if (dataDirty)
             {
                 SaveData();
@@ -63,6 +152,8 @@ namespace Oxide.Plugins
 
         private void Unload()
         {
+            FlushAudit();
+
             if (dataDirty)
             {
                 SaveData();
@@ -81,14 +172,13 @@ namespace Oxide.Plugins
         {
             if (player != null)
             {
-                openBox.Remove(player.userID);
-                busy.Remove(player.userID);
+                sessions.Remove(player.userID);
             }
         }
 
         private void OnLootEntity(BasePlayer player, BaseEntity entity)
         {
-            if (player == null || entity == null)
+            if (player == null || entity == null || !IsSortableContainer(entity))
             {
                 return;
             }
@@ -98,19 +188,26 @@ namespace Oxide.Plugins
                 return;
             }
 
-            if (!config.AllowedContainers.Contains(entity.ShortPrefabName))
-            {
-                return;
-            }
-
-            if (!(entity is IItemContainerEntity))
-            {
-                return;
-            }
-
-            openBox[player.userID] = entity;
-            ShowPanel(player, entity);
+            var session = GetSession(player);
+            session.Box = entity;
+            session.Search = null;
+            session.Page = 0;
+            session.PickerOpen = false;
+            ShowUi(player);
         }
+
+        private void OnLootEntityEnd(BasePlayer player, BaseCombatEntity entity)
+        {
+            if (player == null)
+            {
+                return;
+            }
+
+            CuiHelper.DestroyUi(player, PanelId);
+            sessions.Remove(player.userID);
+        }
+
+        // ------------------------------------------------------------------ setup
 
         private void LoadConfig()
         {
@@ -128,6 +225,31 @@ namespace Oxide.Plugins
             {
                 config = PluginConfig.Default();
             }
+
+            var defaults = PluginConfig.Default();
+
+            if (config.AllowedContainers == null)
+            {
+                config.AllowedContainers = defaults.AllowedContainers;
+            }
+
+            if (config.ChatCommands == null)
+            {
+                config.ChatCommands = defaults.ChatCommands;
+            }
+
+            if (config.Ui == null)
+            {
+                config.Ui = defaults.Ui;
+            }
+
+            if (config.Ui.Colors == null)
+            {
+                config.Ui.Colors = defaults.Ui.Colors;
+            }
+
+            // Writes back so options added in later versions appear in an existing file.
+            Config.WriteObject(config, true);
         }
 
         private void RegisterPermissions()
@@ -154,12 +276,7 @@ namespace Oxide.Plugins
 
             foreach (var def in ItemManager.itemList)
             {
-                if (def == null || string.IsNullOrEmpty(def.shortname))
-                {
-                    continue;
-                }
-
-                if (def.category == ItemCategory.All || def.category == ItemCategory.Favourite || def.category == ItemCategory.Search)
+                if (def == null || string.IsNullOrEmpty(def.shortname) || HiddenCategories.Contains(def.category.ToString()))
                 {
                     continue;
                 }
@@ -173,11 +290,7 @@ namespace Oxide.Plugins
 
         private void LoadData()
         {
-            data = Interface.Oxide.DataFileSystem.ReadObject<SorterData>(DataFile);
-            if (data == null)
-            {
-                data = new SorterData();
-            }
+            data = Interface.Oxide.DataFileSystem.ReadObject<SorterData>(DataFile) ?? new SorterData();
 
             if (data.Boxes == null)
             {
@@ -196,6 +309,7 @@ namespace Oxide.Plugins
             dataDirty = false;
         }
 
+        // Batches writes so a busy server never saves per item move.
         private void MarkDirty()
         {
             dataDirty = true;
@@ -216,13 +330,77 @@ namespace Oxide.Plugins
             });
         }
 
-        // Stable box identity: owner, prefab and exact position survive restarts, net IDs do not.
-        // Two decimals keeps neighbours distinct and is immune to locale decimal separators.
+        // ------------------------------------------------------------------ audit log
+
+        // Buffered so file IO never happens on the game thread during a sort.
+        private void Audit(BasePlayer player, string message)
+        {
+            if (!config.LogActions)
+            {
+                return;
+            }
+
+            auditBuffer.Add(string.Format(CultureInfo.InvariantCulture, "[{0:yyyy-MM-dd HH:mm:ss}] {1} {2}: {3}",
+                DateTime.UtcNow, player.userID, player.displayName, message));
+
+            if (auditScheduled)
+            {
+                return;
+            }
+
+            auditScheduled = true;
+            timer.Once(60f, FlushAudit);
+        }
+
+        private void FlushAudit()
+        {
+            auditScheduled = false;
+
+            if (auditBuffer.Count == 0)
+            {
+                return;
+            }
+
+            try
+            {
+                var directory = Path.Combine(Interface.Oxide.LogDirectory, "PrecisionSorter");
+                Directory.CreateDirectory(directory);
+
+                var file = Path.Combine(directory, DateTime.UtcNow.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) + ".txt");
+                File.AppendAllLines(file, auditBuffer);
+            }
+            catch (Exception ex)
+            {
+                PrintWarning($"Audit write failed: {ex.Message}");
+            }
+
+            auditBuffer.Clear();
+        }
+
+        // ------------------------------------------------------------------ box identity
+
+        // Owner, prefab and exact position survive restarts; net IDs do not.
+        // Invariant culture keeps keys identical on comma-decimal server locales.
+        private static string BuildKey(ulong ownerId, string prefab, Vector3 position)
+        {
+            return string.Format(CultureInfo.InvariantCulture, "{0}|{1}|{2:F2},{3:F2},{4:F2}",
+                ownerId, prefab, position.x, position.y, position.z);
+        }
+
         private static string BuildKey(ulong ownerId, BaseEntity entity)
         {
-            var position = entity.transform.position;
-            return string.Format(CultureInfo.InvariantCulture, "{0}|{1}|{2:F2},{3:F2},{4:F2}",
-                ownerId, entity.ShortPrefabName, position.x, position.y, position.z);
+            return BuildKey(ownerId, entity.ShortPrefabName, entity.transform.position);
+        }
+
+        // The filter belongs to the box, so teammates share one configuration.
+        private static ulong FilterOwner(BaseEntity entity, BasePlayer player)
+        {
+            if (entity.OwnerID != 0)
+            {
+                return entity.OwnerID;
+            }
+
+            return player != null ? player.userID : 0ul;
         }
 
         private BoxFilter GetFilter(ulong ownerId, BaseEntity entity)
@@ -263,41 +441,97 @@ namespace Oxide.Plugins
             return filter.Mode == FilterMode.Whitelist ? listed : !listed;
         }
 
-        private bool TryGetOpenBox(BasePlayer player, out BaseEntity entity, out ItemContainer container)
+        // ------------------------------------------------------------------ access rules
+
+        private static bool IsSortableContainer(BaseEntity entity)
         {
-            entity = null;
-            container = null;
-
-            if (!openBox.TryGetValue(player.userID, out entity) || entity == null || entity.IsDestroyed)
-            {
-                return false;
-            }
-
-            var owner = entity as IItemContainerEntity;
-            if (owner == null)
-            {
-                return false;
-            }
-
-            container = owner.inventory;
-            return container != null;
+            return entity is IItemContainerEntity;
         }
 
-        // Snapshot first, then move: never iterate a live list while it mutates.
-        private int SortThis(BasePlayer player, BaseEntity entity, ItemContainer target)
+        private static bool CanReach(BasePlayer player, BaseEntity box)
         {
-            var filter = GetFilter(player.userID, entity);
-            if (filter == null)
+            if (box.OwnerID == player.userID)
             {
-                return 0;
+                return true;
             }
 
-            var sources = new List<ItemContainer> { player.inventory.containerMain };
-            if (config.IncludeHotbar)
+            var privilege = box.GetBuildingPrivilege();
+            return privilege != null && privilege.IsAuthed(player);
+        }
+
+        private bool RaidBlocked(BasePlayer player)
+        {
+            if (!config.RespectNoEscape)
             {
-                sources.Add(player.inventory.containerBelt);
+                return false;
             }
 
+            foreach (var hook in RaidBlockHooks)
+            {
+                var result = Interface.CallHook(hook, player);
+                if (result is bool && (bool)result)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool CooldownExceeded(Session session, int perMinute, float now)
+        {
+            if (perMinute <= 0)
+            {
+                return false;
+            }
+
+            session.SortTimes.RemoveAll(time => now - time > 60f);
+            return session.SortTimes.Count >= perMinute;
+        }
+
+        // Pure check: never mutates the session, so callers can decide when to charge.
+        private bool CanOperate(BasePlayer player, BaseEntity box, Session session, string perm, out string reason)
+        {
+            reason = null;
+
+            if (!permission.UserHasPermission(player.UserIDString, UsePerm))
+            {
+                reason = "You do not have permission to use the sorter.";
+                return false;
+            }
+
+            if (!string.IsNullOrEmpty(perm) && !permission.UserHasPermission(player.UserIDString, perm))
+            {
+                reason = "You do not have permission for that action.";
+                return false;
+            }
+
+            if (RaidBlocked(player))
+            {
+                reason = "You cannot sort while raid blocked.";
+                return false;
+            }
+
+            if (config.RequireBuildingPrivilege && !CanReach(player, box))
+            {
+                reason = "You must be authorized on this base.";
+                return false;
+            }
+
+            if (CooldownExceeded(session, config.SortsPerMinute, Time.realtimeSinceStartup))
+            {
+                reason = "Sorting too fast, wait a moment.";
+                return false;
+            }
+
+            return true;
+        }
+
+        // ------------------------------------------------------------------ core operations
+
+        // Snapshot first, then move: never iterate a live list while it mutates.
+        private static int MoveMatching(BoxFilter filter, ItemContainer target, List<ItemContainer> sources)
+        {
             int moved = 0;
 
             foreach (var source in sources)
@@ -309,12 +543,7 @@ namespace Oxide.Plugins
 
                 foreach (var item in source.itemList.ToList())
                 {
-                    if (item?.info == null || !Accepts(filter, item.info))
-                    {
-                        continue;
-                    }
-
-                    if (item.MoveToContainer(target))
+                    if (item?.info != null && Accepts(filter, item.info) && item.MoveToContainer(target))
                     {
                         moved++;
                     }
@@ -324,7 +553,50 @@ namespace Oxide.Plugins
             return moved;
         }
 
-        private int Arrange(BasePlayer player, BaseEntity entity, ItemContainer target)
+        private static int MoveEverything(ItemContainer target, List<ItemContainer> sources)
+        {
+            int moved = 0;
+
+            foreach (var source in sources)
+            {
+                if (source?.itemList == null)
+                {
+                    continue;
+                }
+
+                foreach (var item in source.itemList.ToList())
+                {
+                    if (item?.info != null && item.MoveToContainer(target))
+                    {
+                        moved++;
+                    }
+                }
+            }
+
+            return moved;
+        }
+
+        private static int LootAll(ItemContainer source, ItemContainer destination)
+        {
+            if (source?.itemList == null)
+            {
+                return 0;
+            }
+
+            int moved = 0;
+
+            foreach (var item in source.itemList.ToList())
+            {
+                if (item?.info != null && item.MoveToContainer(destination))
+                {
+                    moved++;
+                }
+            }
+
+            return moved;
+        }
+
+        private static int Arrange(BoxFilter filter, ItemContainer target)
         {
             var list = target?.itemList;
             if (list == null || list.Count < 2)
@@ -332,7 +604,6 @@ namespace Oxide.Plugins
                 return 0;
             }
 
-            var filter = GetFilter(player.userID, entity);
             var ordered = list
                 .OrderBy(item => Accepts(filter, item.info) ? 0 : 1)
                 .ThenBy(item => item.info.displayName.english, StringComparer.OrdinalIgnoreCase)
@@ -347,20 +618,639 @@ namespace Oxide.Plugins
             return ordered.Count;
         }
 
-        private bool Guard(BasePlayer player, string action)
+        // Resolves reachable boxes and their filters once, not per item.
+        private List<SortTarget> NearbyTargets(BasePlayer player)
         {
-            if (busy.Contains(player.userID))
+            var targets = new List<SortTarget>();
+            var candidates = new List<BaseEntity>();
+
+            Vis.Entities(player.transform.position, config.NearbyRadius, candidates);
+
+            foreach (var entity in candidates)
             {
-                SendReply(player, "A sort is already running.");
+                if (entity == null || entity.IsDestroyed || !IsSortableContainer(entity))
+                {
+                    continue;
+                }
+
+                if (!config.AllowedContainers.Contains(entity.ShortPrefabName) || !CanReach(player, entity))
+                {
+                    continue;
+                }
+
+                var container = ((IItemContainerEntity)entity).inventory;
+                if (container == null)
+                {
+                    continue;
+                }
+
+                targets.Add(new SortTarget
+                {
+                    Container = container,
+                    Filter = GetFilter(FilterOwner(entity, player), entity)
+                });
+            }
+
+            return targets;
+        }
+
+        private int SortNearby(BasePlayer player, List<ItemContainer> sources)
+        {
+            var targets = NearbyTargets(player);
+            if (targets.Count == 0)
+            {
+                return 0;
+            }
+
+            int moved = 0;
+
+            foreach (var source in sources)
+            {
+                if (source?.itemList == null)
+                {
+                    continue;
+                }
+
+                foreach (var item in source.itemList.ToList())
+                {
+                    if (item?.info == null)
+                    {
+                        continue;
+                    }
+
+                    foreach (var target in targets)
+                    {
+                        if (Accepts(target.Filter, item.info) && item.MoveToContainer(target.Container))
+                        {
+                            moved++;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            return moved;
+        }
+
+        private List<ItemContainer> SourceContainers(BasePlayer player)
+        {
+            var sources = new List<ItemContainer> { player.inventory.containerMain };
+
+            if (config.IncludeHotbar)
+            {
+                sources.Add(player.inventory.containerBelt);
+            }
+
+            return sources;
+        }
+
+        // ------------------------------------------------------------------ session and ui state
+
+        private Session GetSession(BasePlayer player)
+        {
+            Session session;
+            if (!sessions.TryGetValue(player.userID, out session))
+            {
+                session = new Session();
+                sessions[player.userID] = session;
+            }
+
+            return session;
+        }
+
+        private bool TryGetOpenBox(BasePlayer player, out Session session, out BaseEntity entity, out ItemContainer container)
+        {
+            session = GetSession(player);
+            entity = session.Box;
+            container = null;
+
+            if (entity == null || entity.IsDestroyed)
+            {
+                session.Box = null;
                 return false;
             }
 
-            busy.Add(player.userID);
-            return true;
+            var owner = entity as IItemContainerEntity;
+            if (owner == null)
+            {
+                return false;
+            }
+
+            container = owner.inventory;
+            return container != null;
         }
 
-        [ChatCommand("ps")]
-        private void CmdPs(BasePlayer player, string command, string[] args)
+        private void CloseUi(BasePlayer player)
+        {
+            CuiHelper.DestroyUi(player, PanelId);
+            sessions.Remove(player.userID);
+        }
+
+        private void ShowUi(BasePlayer player)
+        {
+            Session session;
+            BaseEntity entity;
+            ItemContainer container;
+
+            if (!TryGetOpenBox(player, out session, out entity, out container))
+            {
+                return;
+            }
+
+            if (session.PickerOpen)
+            {
+                ShowPicker(player, session, entity);
+            }
+            else
+            {
+                ShowMain(player, session, entity);
+            }
+        }
+
+        // ------------------------------------------------------------------ ui building
+
+        private static string Anchor(float x, float y)
+        {
+            return string.Format(CultureInfo.InvariantCulture, "{0:0.####} {1:0.####}", x, y);
+        }
+
+        private void AddButton(CuiElementContainer cui, string parent, string text, string command, string color, float xMin, float xMax, float yMin, float yMax, int fontSize = 12)
+        {
+            cui.Add(new CuiButton
+            {
+                Button = { Command = command, Color = color },
+                Text = { Text = text, FontSize = fontSize, Align = TextAnchor.MiddleCenter, Color = ColorText },
+                RectTransform = { AnchorMin = Anchor(xMin, yMin), AnchorMax = Anchor(xMax, yMax) }
+            }, parent);
+        }
+
+        private void AddLabel(CuiElementContainer cui, string parent, string text, float xMin, float xMax, float yMin, float yMax, int fontSize = 12, TextAnchor align = TextAnchor.MiddleCenter)
+        {
+            cui.Add(new CuiLabel
+            {
+                Text = { Text = text, FontSize = fontSize, Align = align, Color = ColorText },
+                RectTransform = { AnchorMin = Anchor(xMin, yMin), AnchorMax = Anchor(xMax, yMax) }
+            }, parent);
+        }
+
+        private CuiElementContainer NewPanel(string name, string offsetMin, string offsetMax, bool keyboard)
+        {
+            var cui = new CuiElementContainer();
+            cui.Add(new CuiPanel
+            {
+                Image = { Color = ColorPanel },
+                RectTransform =
+                {
+                    AnchorMin = config.Ui.AnchorMin,
+                    AnchorMax = config.Ui.AnchorMax,
+                    OffsetMin = offsetMin,
+                    OffsetMax = offsetMax
+                },
+                CursorEnabled = true,
+                KeyboardEnabled = keyboard
+            }, "Overlay", name);
+
+            cui.Add(new CuiPanel
+            {
+                Image = { Color = ColorHeader },
+                RectTransform = { AnchorMin = "0 0.9", AnchorMax = "1 1" }
+            }, name);
+
+            return cui;
+        }
+
+        private void ShowMain(BasePlayer player, Session session, BaseEntity entity)
+        {
+            CuiHelper.DestroyUi(player, PanelId);
+
+            var filter = GetFilter(FilterOwner(entity, player), entity);
+            var summary = filter == null
+                ? "No filter set - open Filter to choose items"
+                : $"{filter.Mode} | {filter.Items.Count} items | {filter.Categories.Count} categories | {filter.Exclude.Count} excluded";
+
+            var cui = NewPanel(PanelId, config.Ui.MainOffsetMin, config.Ui.MainOffsetMax, false);
+
+            AddLabel(cui, PanelId, $"PrecisionSorter - {entity.ShortPrefabName}", 0.02f, 0.98f, 0.90f, 0.99f, 15);
+            AddLabel(cui, PanelId, summary, 0.03f, 0.97f, 0.79f, 0.88f, 11);
+
+            AddButton(cui, PanelId, "This", "ps.run this", ColorAction, 0.04f, 0.32f, 0.62f, 0.74f);
+            AddButton(cui, PanelId, "Nearby", "ps.run nearby", ColorButton, 0.36f, 0.64f, 0.62f, 0.74f);
+            AddButton(cui, PanelId, "Arrange", "ps.run arrange", ColorButton, 0.68f, 0.96f, 0.62f, 0.74f);
+
+            AddButton(cui, PanelId, "Dump All", "ps.run dumpall", ColorButton, 0.04f, 0.32f, 0.46f, 0.58f);
+            AddButton(cui, PanelId, "Loot All", "ps.run lootall", ColorButton, 0.36f, 0.64f, 0.46f, 0.58f);
+            AddButton(cui, PanelId, "Filter...", "ps.ui open", ColorAction, 0.68f, 0.96f, 0.46f, 0.58f);
+
+            AddLabel(cui, PanelId, "This moves matching items in. Nearby spreads them across your boxes. Arrange reorders the box.", 0.04f, 0.96f, 0.28f, 0.38f, 10);
+            AddButton(cui, PanelId, "Close", "ps.ui close", ColorDanger, 0.36f, 0.64f, 0.08f, 0.20f);
+
+            CuiHelper.AddUi(player, cui);
+        }
+
+        private void ShowPicker(BasePlayer player, Session session, BaseEntity entity)
+        {
+            CuiHelper.DestroyUi(player, PanelId);
+
+            var filter = EnsureFilter(FilterOwner(entity, player), entity);
+            var visible = VisibleItems(session);
+            int pageCount = Math.Max(1, (visible.Count + PageSize - 1) / PageSize);
+            session.Page = Math.Min(Math.Max(session.Page, 0), pageCount - 1);
+
+            var cui = NewPanel(PanelId, config.Ui.PickerOffsetMin, config.Ui.PickerOffsetMax, true);
+
+            AddLabel(cui, PanelId, $"{entity.ShortPrefabName} filter - {filter.Mode}", 0.02f, 0.98f, 0.91f, 0.99f, 15);
+
+            cui.Add(new CuiElement
+            {
+                Parent = PanelId,
+                Components =
+                {
+                    new CuiImageComponent { Color = "0.16 0.16 0.16 1" },
+                    new CuiRectTransformComponent { AnchorMin = Anchor(0.02f, 0.84f), AnchorMax = Anchor(0.60f, 0.90f) },
+                    new CuiInputFieldComponent
+                    {
+                        Command = "ps.ui search",
+                        Text = session.Search ?? string.Empty,
+                        FontSize = 12,
+                        Align = TextAnchor.MiddleLeft,
+                        Color = ColorText,
+                        CharsLimit = 28,
+                        NeedsKeyboard = true
+                    }
+                }
+            });
+
+            AddLabel(cui, PanelId, "Type and press Enter to search", 0.02f, 0.60f, 0.80f, 0.84f, 9, TextAnchor.MiddleLeft);
+            AddButton(cui, PanelId, "Clear search", "ps.ui search", ColorMuted, 0.62f, 0.76f, 0.84f, 0.90f, 10);
+            AddButton(cui, PanelId, "Clear filter", "ps.ui clear", ColorDanger, 0.78f, 0.98f, 0.84f, 0.90f, 10);
+
+            AddCategoryRow(cui, filter);
+            AddItemGrid(cui, filter, visible, session.Page);
+
+            AddLabel(cui, PanelId, $"Page {session.Page + 1} / {pageCount}   ({visible.Count} items)", 0.30f, 0.70f, 0.02f, 0.07f, 10);
+            AddButton(cui, PanelId, "< Prev", "ps.ui page " + (session.Page - 1), ColorButton, 0.03f, 0.15f, 0.02f, 0.07f, 10);
+            AddButton(cui, PanelId, "Next >", "ps.ui page " + (session.Page + 1), ColorButton, 0.85f, 0.97f, 0.02f, 0.07f, 10);
+            AddButton(cui, PanelId, "Mode: " + filter.Mode, "ps.ui mode", ColorButton, 0.17f, 0.29f, 0.02f, 0.07f, 10);
+            AddButton(cui, PanelId, "Back", "ps.ui back", ColorAction, 0.42f, 0.58f, 0.02f, 0.07f, 10);
+            AddButton(cui, PanelId, "Close", "ps.ui close", ColorDanger, 0.71f, 0.83f, 0.02f, 0.07f, 10);
+
+            CuiHelper.AddUi(player, cui);
+        }
+
+        private void AddCategoryRow(CuiElementContainer cui, BoxFilter filter)
+        {
+            const int perRow = 7;
+            const float width = 0.94f / perRow;
+
+            for (int i = 0; i < CategoryNames.Length; i++)
+            {
+                int row = i / perRow;
+                int column = i % perRow;
+                float xMin = 0.03f + column * width;
+                float yMax = 0.79f - row * 0.075f;
+                bool on = filter.Categories.Contains(CategoryNames[i]);
+
+                AddButton(cui, PanelId, CategoryNames[i], "ps.ui cat " + CategoryNames[i],
+                    on ? ColorSelected : ColorMuted, xMin, xMin + width - 0.008f, yMax - 0.065f, yMax, 9);
+            }
+        }
+
+        private void AddItemGrid(CuiElementContainer cui, BoxFilter filter, List<ItemDefinition> visible, int currentPage)
+        {
+            const float width = 0.94f / GridColumns;
+            int start = currentPage * PageSize;
+
+            for (int i = 0; i < PageSize; i++)
+            {
+                int index = start + i;
+                if (index >= visible.Count)
+                {
+                    return;
+                }
+
+                var def = visible[index];
+                int row = i / GridColumns;
+                int column = i % GridColumns;
+                float xMin = 0.03f + column * width;
+                float yMax = 0.60f - row * 0.062f;
+                bool on = filter.Items.Contains(def.shortname);
+
+                AddButton(cui, PanelId, Shorten(def.displayName.english), "ps.ui item " + def.shortname,
+                    on ? ColorSelected : ColorMuted, xMin, xMin + width - 0.006f, yMax - 0.055f, yMax, 9);
+            }
+        }
+
+        private static string Shorten(string text)
+        {
+            if (string.IsNullOrEmpty(text) || text.Length <= MaxNameLength)
+            {
+                return text;
+            }
+
+            return text.Substring(0, MaxNameLength - 1) + ".";
+        }
+
+        // Filtering 1259 items per click is wasted work, so the result is cached per query.
+        private List<ItemDefinition> VisibleItems(Session session)
+        {
+            if (session.CachedItems != null && session.CachedQuery == session.Search)
+            {
+                return session.CachedItems;
+            }
+
+            session.CachedQuery = session.Search;
+            session.CachedItems = string.IsNullOrEmpty(session.Search)
+                ? catalog
+                : catalog.Where(def => def.displayName.english.IndexOf(session.Search, StringComparison.OrdinalIgnoreCase) >= 0).ToList();
+
+            return session.CachedItems;
+        }
+
+        // ------------------------------------------------------------------ actions
+
+        private void Execute(BasePlayer player, string key)
+        {
+            switch (key)
+            {
+                case "this":
+                    ExecuteAction(player, null, "Moved", DoThis);
+                    break;
+                case "nearby":
+                    ExecuteAction(player, NearbyPerm, "Moved nearby", DoNearby);
+                    break;
+                case "arrange":
+                    ExecuteAction(player, ArrangePerm, "Arranged", DoArrange);
+                    break;
+                case "dumpall":
+                    ExecuteAction(player, DumpAllPerm, "Dumped", DoDumpAll);
+                    break;
+                case "lootall":
+                    ExecuteAction(player, LootAllPerm, "Looted", DoLootAll);
+                    break;
+            }
+        }
+
+        private void ExecuteAction(BasePlayer player, string perm, string label, Func<BasePlayer, BaseEntity, ItemContainer, int> action)
+        {
+            Session session;
+            BaseEntity entity;
+            ItemContainer container;
+
+            if (!TryGetOpenBox(player, out session, out entity, out container))
+            {
+                SendReply(player, "Open an allowed container first.");
+                return;
+            }
+
+            string reason;
+            if (!CanOperate(player, entity, session, perm, out reason))
+            {
+                SendReply(player, reason);
+                return;
+            }
+
+            if (session.Busy)
+            {
+                SendReply(player, "A sort is already running.");
+                return;
+            }
+
+            session.Busy = true;
+
+            try
+            {
+                int moved = action(player, entity, container);
+                SendReply(player, $"{label}: {moved} items.");
+                Audit(player, $"{label} {moved} items in {entity.ShortPrefabName}");
+            }
+            finally
+            {
+                session.Busy = false;
+                session.SortTimes.Add(Time.realtimeSinceStartup);
+            }
+
+            ShowUi(player);
+        }
+
+        private int DoThis(BasePlayer player, BaseEntity entity, ItemContainer container)
+        {
+            return MoveMatching(GetFilter(FilterOwner(entity, player), entity), container, SourceContainers(player));
+        }
+
+        private int DoNearby(BasePlayer player, BaseEntity entity, ItemContainer container)
+        {
+            return SortNearby(player, SourceContainers(player));
+        }
+
+        private int DoArrange(BasePlayer player, BaseEntity entity, ItemContainer container)
+        {
+            return Arrange(GetFilter(FilterOwner(entity, player), entity), container);
+        }
+
+        private int DoDumpAll(BasePlayer player, BaseEntity entity, ItemContainer container)
+        {
+            return MoveEverything(container, SourceContainers(player));
+        }
+
+        private int DoLootAll(BasePlayer player, BaseEntity entity, ItemContainer container)
+        {
+            return LootAll(container, player.inventory.containerMain);
+        }
+
+        // ------------------------------------------------------------------ picker editing
+
+        private void ApplySearch(BasePlayer player, string text)
+        {
+            var session = GetSession(player);
+            session.Search = string.IsNullOrEmpty(text) ? null : text;
+            session.Page = 0;
+            ShowUi(player);
+        }
+
+        private void GoToPage(BasePlayer player, string rawPage)
+        {
+            var session = GetSession(player);
+            int target;
+
+            if (rawPage != null && int.TryParse(rawPage, out target))
+            {
+                session.Page = Math.Max(0, target);
+            }
+
+            ShowUi(player);
+        }
+
+        private void ToggleCategory(BasePlayer player, string name)
+        {
+            Session session;
+            BaseEntity entity;
+            ItemContainer container;
+
+            if (name == null || !TryGetOpenBox(player, out session, out entity, out container))
+            {
+                return;
+            }
+
+            ItemCategory parsed;
+            if (!Enum.TryParse(name, true, out parsed))
+            {
+                SendReply(player, $"Unknown category: {name}");
+                return;
+            }
+
+            var filter = EnsureFilter(FilterOwner(entity, player), entity);
+            var canonical = parsed.ToString();
+
+            if (!filter.Categories.Remove(canonical))
+            {
+                filter.Categories.Add(canonical);
+            }
+
+            filter.Rebuild();
+            MarkDirty();
+            ShowUi(player);
+        }
+
+        private void ToggleItem(BasePlayer player, string shortname)
+        {
+            Session session;
+            BaseEntity entity;
+            ItemContainer container;
+
+            if (shortname == null || !TryGetOpenBox(player, out session, out entity, out container))
+            {
+                return;
+            }
+
+            if (!byShortname.ContainsKey(shortname))
+            {
+                SendReply(player, $"Unknown item: {shortname}");
+                return;
+            }
+
+            var filter = EnsureFilter(FilterOwner(entity, player), entity);
+
+            if (!filter.Items.Remove(shortname))
+            {
+                filter.Items.Add(shortname);
+            }
+
+            filter.Rebuild();
+            MarkDirty();
+            ShowUi(player);
+        }
+
+        private void ToggleMode(BasePlayer player)
+        {
+            Session session;
+            BaseEntity entity;
+            ItemContainer container;
+
+            if (!TryGetOpenBox(player, out session, out entity, out container))
+            {
+                return;
+            }
+
+            var filter = EnsureFilter(FilterOwner(entity, player), entity);
+            filter.Mode = filter.Mode == FilterMode.Whitelist ? FilterMode.Blacklist : FilterMode.Whitelist;
+            MarkDirty();
+            ShowUi(player);
+        }
+
+        private void ClearFilter(BasePlayer player)
+        {
+            Session session;
+            BaseEntity entity;
+            ItemContainer container;
+
+            if (!TryGetOpenBox(player, out session, out entity, out container))
+            {
+                return;
+            }
+
+            data.Boxes.Remove(BuildKey(FilterOwner(entity, player), entity));
+            MarkDirty();
+            SendReply(player, "Filter cleared.");
+            ShowUi(player);
+        }
+
+        private void SetPicker(BasePlayer player, bool open)
+        {
+            var session = GetSession(player);
+            session.PickerOpen = open;
+            ShowUi(player);
+        }
+
+        // ------------------------------------------------------------------ command entry points
+
+        // ConsoleSystem.Arg.Args holds StringView values, not strings, in this Oxide build.
+        private static string ArgText(ConsoleSystem.Arg arg, int index)
+        {
+            return arg.Args != null && arg.Args.Length > index ? arg.Args[index].ToString() : null;
+        }
+
+        private static string ArgTextFrom(ConsoleSystem.Arg arg, int startIndex)
+        {
+            if (arg.Args == null || arg.Args.Length <= startIndex)
+            {
+                return null;
+            }
+
+            return string.Join(" ", arg.Args.Skip(startIndex).Select(part => part.ToString())).Trim();
+        }
+
+        [ConsoleCommand("ps.run")]
+        private void CmdRun(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player != null)
+            {
+                Execute(player, (ArgText(arg, 0) ?? string.Empty).ToLowerInvariant());
+            }
+        }
+
+        [ConsoleCommand("ps.ui")]
+        private void CmdUi(ConsoleSystem.Arg arg)
+        {
+            var player = arg.Player();
+            if (player == null)
+            {
+                return;
+            }
+
+            switch ((ArgText(arg, 0) ?? string.Empty).ToLowerInvariant())
+            {
+                case "open":
+                    SetPicker(player, true);
+                    break;
+                case "back":
+                    SetPicker(player, false);
+                    break;
+                case "close":
+                    CloseUi(player);
+                    break;
+                case "search":
+                    ApplySearch(player, ArgTextFrom(arg, 1));
+                    break;
+                case "cat":
+                    ToggleCategory(player, ArgText(arg, 1));
+                    break;
+                case "item":
+                    ToggleItem(player, ArgText(arg, 1));
+                    break;
+                case "page":
+                    GoToPage(player, ArgText(arg, 1));
+                    break;
+                case "mode":
+                    ToggleMode(player);
+                    break;
+                case "clear":
+                    ClearFilter(player);
+                    break;
+            }
+        }
+
+        private void CmdChat(BasePlayer player, string command, string[] args)
         {
             if (player == null)
             {
@@ -375,197 +1265,31 @@ namespace Oxide.Plugins
 
             if (args == null || args.Length == 0)
             {
-                SendReply(player, "/ps this | arrange | add <item> | cat <category> | exclude <item> | mode <whitelist|blacklist> | clear | show | find <text>");
+                SendReply(player, "/ps this | nearby | arrange | dumpall | lootall | open | find <text> | exclude <item>");
                 return;
             }
 
-            BaseEntity entity;
-            ItemContainer container;
+            var verb = args[0].ToLowerInvariant();
 
-            switch (args[0].ToLowerInvariant())
+            if (verb == "open")
             {
-                case "this":
-                    if (!TryGetOpenBox(player, out entity, out container))
-                    {
-                        SendReply(player, "Open an allowed container first.");
-                        return;
-                    }
-
-                    if (!Guard(player, "this"))
-                    {
-                        return;
-                    }
-
-                    try
-                    {
-                        SendReply(player, $"Moved {SortThis(player, entity, container)} items.");
-                    }
-                    finally
-                    {
-                        busy.Remove(player.userID);
-                    }
-
-                    break;
-
-                case "arrange":
-                    if (!TryGetOpenBox(player, out entity, out container))
-                    {
-                        SendReply(player, "Open an allowed container first.");
-                        return;
-                    }
-
-                    SendReply(player, $"Arranged {Arrange(player, entity, container)} items.");
-                    break;
-
-                case "add":
-                case "cat":
-                case "exclude":
-                    if (args.Length < 2)
-                    {
-                        SendReply(player, $"Usage: /ps {args[0]} <value>");
-                        return;
-                    }
-
-                    EditFilter(player, args[0], args[1]);
-                    break;
-
-                case "mode":
-                    SetMode(player, args.Length > 1 ? args[1] : null);
-                    break;
-
-                case "clear":
-                    ClearFilter(player);
-                    break;
-
-                case "show":
-                    ShowFilter(player);
-                    break;
-
-                case "find":
-                    FindItems(player, args.Length > 1 ? args[1] : null);
-                    break;
-
-                default:
-                    SendReply(player, "Unknown subcommand.");
-                    break;
-            }
-        }
-
-        private void EditFilter(BasePlayer player, string kind, string value)
-        {
-            BaseEntity entity;
-            ItemContainer container;
-
-            if (!TryGetOpenBox(player, out entity, out container))
-            {
-                SendReply(player, "Open an allowed container first.");
+                SetPicker(player, true);
                 return;
             }
 
-            var filter = EnsureFilter(player.userID, entity);
-            value = value.ToLowerInvariant();
-
-            if (kind == "cat")
+            if (verb == "find")
             {
-                ItemCategory category;
-                if (!Enum.TryParse(value, true, out category))
-                {
-                    SendReply(player, $"Unknown category: {value}");
-                    return;
-                }
-
-                filter.Categories.Add(category.ToString());
-            }
-            else if (kind == "add")
-            {
-                if (!byShortname.ContainsKey(value))
-                {
-                    SendReply(player, $"Unknown item: {value}");
-                    return;
-                }
-
-                filter.Items.Add(value);
-            }
-            else
-            {
-                if (!byShortname.ContainsKey(value))
-                {
-                    SendReply(player, $"Unknown item: {value}");
-                    return;
-                }
-
-                filter.Exclude.Add(value);
-            }
-
-            filter.Rebuild();
-            MarkDirty();
-            ShowFilter(player);
-        }
-
-        private void SetMode(BasePlayer player, string mode)
-        {
-            BaseEntity entity;
-            ItemContainer container;
-
-            if (!TryGetOpenBox(player, out entity, out container))
-            {
-                SendReply(player, "Open an allowed container first.");
+                FindItems(player, args.Length > 1 ? args[1] : null);
                 return;
             }
 
-            if (mode != null && mode.Equals("blacklist", StringComparison.OrdinalIgnoreCase))
+            if (verb == "exclude")
             {
-                EnsureFilter(player.userID, entity).Mode = FilterMode.Blacklist;
-            }
-            else if (mode != null && mode.Equals("whitelist", StringComparison.OrdinalIgnoreCase))
-            {
-                EnsureFilter(player.userID, entity).Mode = FilterMode.Whitelist;
-            }
-            else
-            {
-                SendReply(player, "Usage: /ps mode <whitelist|blacklist>");
+                ToggleExclusion(player, args.Length > 1 ? args[1] : null);
                 return;
             }
 
-            MarkDirty();
-            ShowFilter(player);
-        }
-
-        private void ClearFilter(BasePlayer player)
-        {
-            BaseEntity entity;
-            ItemContainer container;
-
-            if (!TryGetOpenBox(player, out entity, out container))
-            {
-                SendReply(player, "Open an allowed container first.");
-                return;
-            }
-
-            data.Boxes.Remove(BuildKey(player.userID, entity));
-            MarkDirty();
-            SendReply(player, "Filter cleared.");
-        }
-
-        private void ShowFilter(BasePlayer player)
-        {
-            BaseEntity entity;
-            ItemContainer container;
-
-            if (!TryGetOpenBox(player, out entity, out container))
-            {
-                SendReply(player, "Open an allowed container first.");
-                return;
-            }
-
-            var filter = GetFilter(player.userID, entity);
-            if (filter == null)
-            {
-                SendReply(player, "No filter on this container.");
-                return;
-            }
-
-            SendReply(player, $"Mode: {filter.Mode} | Items: {string.Join(", ", filter.Items)} | Categories: {string.Join(", ", filter.Categories)} | Exclude: {string.Join(", ", filter.Exclude)}");
+            Execute(player, verb);
         }
 
         private void FindItems(BasePlayer player, string text)
@@ -584,7 +1308,41 @@ namespace Oxide.Plugins
             SendReply(player, "Matches: " + string.Join(", ", matches));
         }
 
-        // Diagnostic: proves the matcher against the live item DB without needing a client.
+        private void ToggleExclusion(BasePlayer player, string shortname)
+        {
+            Session session;
+            BaseEntity entity;
+            ItemContainer container;
+
+            if (shortname == null || !TryGetOpenBox(player, out session, out entity, out container))
+            {
+                return;
+            }
+
+            shortname = shortname.ToLowerInvariant();
+
+            if (!byShortname.ContainsKey(shortname))
+            {
+                SendReply(player, $"Unknown item: {shortname}");
+                return;
+            }
+
+            var filter = EnsureFilter(FilterOwner(entity, player), entity);
+
+            if (!filter.Exclude.Remove(shortname))
+            {
+                filter.Exclude.Add(shortname);
+            }
+
+            filter.Rebuild();
+            MarkDirty();
+            SendReply(player, $"Excluded: {string.Join(", ", filter.Exclude)}");
+            ShowUi(player);
+        }
+
+        // ------------------------------------------------------------------ diagnostics
+
+        // Proves the matcher and the saved data against the live item DB.
         [ConsoleCommand("ps.selftest")]
         private void CmdSelfTest(ConsoleSystem.Arg arg)
         {
@@ -613,6 +1371,16 @@ namespace Oxide.Plugins
 
             filter.Mode = FilterMode.Blacklist;
             PrintWarning($"Selftest: blacklist flips rifle.ak to {Accepts(filter, Find("rifle.ak"))} (expected False)");
+
+            var unknownCategories = data.Boxes.Values.SelectMany(box => box.UnknownCategories).Distinct().ToList();
+            PrintWarning(unknownCategories.Count == 0
+                ? "Selftest: every saved category still exists in the game."
+                : "Selftest: saved categories missing from the game: " + string.Join(", ", unknownCategories));
+
+            var deadItems = data.Boxes.Values.SelectMany(box => box.Items).Distinct().Where(shortname => !byShortname.ContainsKey(shortname)).ToList();
+            PrintWarning(deadItems.Count == 0
+                ? "Selftest: every saved item shortname still exists in the game."
+                : "Selftest: saved items missing from the game: " + string.Join(", ", deadItems));
         }
 
         private ItemDefinition Find(string shortname)
@@ -621,117 +1389,269 @@ namespace Oxide.Plugins
             return byShortname.TryGetValue(shortname, out def) ? def : null;
         }
 
-        private void ShowPanel(BasePlayer player, BaseEntity entity)
+        // ------------------------------------------------------------------ test harness
+
+        [ConsoleCommand("ps.harness")]
+        private void CmdHarness(ConsoleSystem.Arg arg)
         {
-            CuiHelper.DestroyUi(player, PanelId);
-
-            var filter = GetFilter(player.userID, entity);
-            var summary = filter == null
-                ? "No filter set"
-                : $"{filter.Mode} | {filter.Items.Count} items | {filter.Categories.Count} categories";
-
-            var cui = new CuiElementContainer();
-            cui.Add(new CuiPanel
+            if (arg.Connection != null && !arg.IsAdmin)
             {
-                Image = { Color = "0.1 0.1 0.1 0.9" },
-                RectTransform = { AnchorMin = "0.5 0.5", AnchorMax = "0.5 0.5", OffsetMin = "-220 -140", OffsetMax = "220 140" },
-                CursorEnabled = true
-            }, "Overlay", PanelId);
+                return;
+            }
 
-            cui.Add(new CuiLabel
+            if (!config.EnableHarness)
             {
-                Text = { Text = $"PrecisionSorter - {entity.ShortPrefabName}", FontSize = 14, Align = TextAnchor.MiddleCenter },
-                RectTransform = { AnchorMin = "0 0.88", AnchorMax = "1 0.98" }
-            }, PanelId);
+                PrintWarning("Harness disabled. Set EnableHarness true in the config to run it.");
+                return;
+            }
 
-            cui.Add(new CuiLabel
+            switch ((ArgText(arg, 0) ?? "run").ToLowerInvariant())
             {
-                Text = { Text = summary, FontSize = 11, Align = TextAnchor.MiddleCenter },
-                RectTransform = { AnchorMin = "0 0.78", AnchorMax = "1 0.88" }
-            }, PanelId);
-
-            cui.Add(new CuiButton
-            {
-                Button = { Command = "ps.this", Color = "0.2 0.5 0.2 0.9" },
-                Text = { Text = "This", FontSize = 12, Align = TextAnchor.MiddleCenter },
-                RectTransform = { AnchorMin = "0.08 0.62", AnchorMax = "0.48 0.74" }
-            }, PanelId);
-
-            cui.Add(new CuiButton
-            {
-                Button = { Command = "ps.arrange", Color = "0.2 0.4 0.6 0.9" },
-                Text = { Text = "Arrange", FontSize = 12, Align = TextAnchor.MiddleCenter },
-                RectTransform = { AnchorMin = "0.52 0.62", AnchorMax = "0.92 0.74" }
-            }, PanelId);
-
-            cui.Add(new CuiButton
-            {
-                Button = { Command = "ps.close", Color = "0.6 0.2 0.2 0.9" },
-                Text = { Text = "Close", FontSize = 12, Align = TextAnchor.MiddleCenter },
-                RectTransform = { AnchorMin = "0.4 0.02", AnchorMax = "0.6 0.12" }
-            }, PanelId);
-
-            CuiHelper.AddUi(player, cui);
+                case "run":
+                    int iterations = 200;
+                    int.TryParse(ArgText(arg, 1), out iterations);
+                    RunConservation(Math.Max(1, iterations));
+                    break;
+                case "save":
+                    HarnessSaveFilter();
+                    break;
+                case "check":
+                    HarnessCheckFilter();
+                    break;
+                case "clear":
+                    HarnessClear();
+                    break;
+                default:
+                    PrintWarning("Usage: ps.harness run [n] | save | check | clear");
+                    break;
+            }
         }
 
-        [ConsoleCommand("ps.close")]
-        private void CmdClose(ConsoleSystem.Arg arg)
+        private static string HarnessKey(Vector3 position)
         {
-            var player = arg.Player();
-            if (player == null)
-            {
-                return;
-            }
-
-            CuiHelper.DestroyUi(player, PanelId);
+            return BuildKey(0ul, "woodbox_deployed", position);
         }
 
-        [ConsoleCommand("ps.this")]
-        private void CmdThis(ConsoleSystem.Arg arg)
+        private StorageContainer SpawnTestBox(Vector3 position)
         {
-            var player = arg.Player();
-            if (player == null)
+            var entity = GameManager.server.CreateEntity(TestBoxPrefab, position);
+            if (entity == null)
+            {
+                return null;
+            }
+
+            entity.Spawn();
+            return entity as StorageContainer;
+        }
+
+        private static void KillTestBox(BaseEntity box)
+        {
+            if (box != null && !box.IsDestroyed)
+            {
+                box.Kill();
+            }
+        }
+
+        private void SeedItems(ItemContainer container)
+        {
+            for (int i = 0; i < HarnessItems.Length; i++)
+            {
+                var def = Find(HarnessItems[i]);
+                if (def == null)
+                {
+                    continue;
+                }
+
+                var item = ItemManager.CreateByName(HarnessItems[i], Math.Max(1, (def.stackable / (i % 3 + 1)) + i));
+                if (item == null)
+                {
+                    continue;
+                }
+
+                if (!item.MoveToContainer(container))
+                {
+                    item.Remove();
+                }
+            }
+        }
+
+        private static void ClearContainer(ItemContainer container)
+        {
+            if (container?.itemList == null)
             {
                 return;
             }
 
-            BaseEntity entity;
-            ItemContainer container;
-
-            if (!TryGetOpenBox(player, out entity, out container) || !Guard(player, "this"))
+            foreach (var item in container.itemList.ToList())
             {
+                item.Remove();
+            }
+        }
+
+        private static void Measure(ItemContainer first, ItemContainer second, out long count, out long amount, out List<Item> items)
+        {
+            count = 0;
+            amount = 0;
+            items = new List<Item>();
+
+            foreach (var container in new[] { first, second })
+            {
+                if (container?.itemList == null)
+                {
+                    continue;
+                }
+
+                foreach (var item in container.itemList)
+                {
+                    if (item == null)
+                    {
+                        continue;
+                    }
+
+                    count++;
+                    amount += item.amount;
+                    items.Add(item);
+                }
+            }
+        }
+
+        // Proves no action creates, destroys or double-owns an item.
+        private void RunConservation(int iterations)
+        {
+            var source = SpawnTestBox(HarnessSourcePos);
+            var target = SpawnTestBox(HarnessTargetPos);
+
+            if (source == null || target == null)
+            {
+                PrintWarning("Harness: could not spawn test boxes.");
+                KillTestBox(source);
+                KillTestBox(target);
                 return;
             }
+
+            var filter = new BoxFilter();
+            filter.Categories.Add(ItemCategory.Weapon.ToString());
+            filter.Categories.Add(ItemCategory.Resources.ToString());
+            filter.Items.Add("ammo.rifle");
+            filter.Rebuild();
+
+            var sources = new List<ItemContainer> { source.inventory };
+            int conservationFailures = 0;
+            int duplicateFailures = 0;
+            int capacityFailures = 0;
 
             try
             {
-                SendReply(player, $"Moved {SortThis(player, entity, container)} items.");
+                for (int i = 0; i < iterations; i++)
+                {
+                    SeedItems(source.inventory);
+
+                    long beforeCount, beforeAmount;
+                    List<Item> ignored;
+                    Measure(source.inventory, target.inventory, out beforeCount, out beforeAmount, out ignored);
+
+                    switch (i % 3)
+                    {
+                        case 0:
+                            MoveMatching(filter, target.inventory, sources);
+                            break;
+                        case 1:
+                            MoveEverything(target.inventory, sources);
+                            break;
+                        default:
+                            Arrange(filter, target.inventory);
+                            break;
+                    }
+
+                    long afterCount, afterAmount;
+                    List<Item> afterItems;
+                    Measure(source.inventory, target.inventory, out afterCount, out afterAmount, out afterItems);
+
+                    if (beforeCount != afterCount || beforeAmount != afterAmount)
+                    {
+                        conservationFailures++;
+                        if (conservationFailures <= 3)
+                        {
+                            PrintWarning($"Harness: conservation broke on iteration {i} ({beforeCount}/{beforeAmount} -> {afterCount}/{afterAmount}).");
+                        }
+                    }
+
+                    if (afterItems.Distinct().Count() != afterItems.Count)
+                    {
+                        duplicateFailures++;
+                    }
+
+                    if (target.inventory.itemList.Count > target.inventory.capacity)
+                    {
+                        capacityFailures++;
+                    }
+
+                    ClearContainer(source.inventory);
+                    ClearContainer(target.inventory);
+                }
             }
             finally
             {
-                busy.Remove(player.userID);
+                KillTestBox(source);
+                KillTestBox(target);
             }
+
+            PrintWarning($"Harness: {iterations} iterations | conservation failures {conservationFailures} | duplicate items {duplicateFailures} | capacity violations {capacityFailures}.");
         }
 
-        [ConsoleCommand("ps.arrange")]
-        private void CmdArrange(ConsoleSystem.Arg arg)
+        private void HarnessSaveFilter()
         {
-            var player = arg.Player();
-            if (player == null)
+            var box = SpawnTestBox(HarnessSourcePos);
+            if (box == null)
             {
+                PrintWarning("Harness: could not spawn test box.");
                 return;
             }
 
-            BaseEntity entity;
-            ItemContainer container;
+            var filter = EnsureFilter(0ul, box);
+            filter.Items.Add("rifle.ak");
+            filter.Items.Add("ammo.rocket.basic");
+            filter.Categories.Add(ItemCategory.Medical.ToString());
+            filter.Rebuild();
+            MarkDirty();
+            SaveData();
 
-            if (!TryGetOpenBox(player, out entity, out container))
-            {
-                return;
-            }
-
-            SendReply(player, $"Arranged {Arrange(player, entity, container)} items.");
+            PrintWarning($"Harness: saved test filter at key {HarnessKey(HarnessSourcePos)}.");
+            KillTestBox(box);
         }
+
+        private void HarnessCheckFilter()
+        {
+            var box = SpawnTestBox(HarnessSourcePos);
+            if (box == null)
+            {
+                PrintWarning("Harness: could not spawn test box.");
+                return;
+            }
+
+            var filter = GetFilter(0ul, box);
+
+            if (filter == null)
+            {
+                PrintWarning($"Harness: NO filter found for key {HarnessKey(HarnessSourcePos)} (persistence failed).");
+            }
+            else
+            {
+                PrintWarning($"Harness: filter found for key {HarnessKey(HarnessSourcePos)} | {filter.Mode} | items {string.Join(", ", filter.Items)} | categories {string.Join(", ", filter.Categories)}.");
+            }
+
+            KillTestBox(box);
+        }
+
+        private void HarnessClear()
+        {
+            data.Boxes.Remove(HarnessKey(HarnessSourcePos));
+            data.Boxes.Remove(HarnessKey(HarnessTargetPos));
+            SaveData();
+            PrintWarning("Harness: test filters cleared.");
+        }
+
+        // ------------------------------------------------------------------ serialized models
 
         [JsonConverter(typeof(StringEnumConverter))]
         public enum FilterMode
@@ -750,10 +1670,15 @@ namespace Oxide.Plugins
             [JsonIgnore]
             public HashSet<ItemCategory> ParsedCategories { get; private set; } = new HashSet<ItemCategory>();
 
+            // Names that no longer exist in the game, surfaced by the selftest after an update.
+            [JsonIgnore]
+            public List<string> UnknownCategories { get; private set; } = new List<string>();
+
             // Category names are stored as text so game enum reordering cannot corrupt saved filters.
             public void Rebuild()
             {
                 ParsedCategories = new HashSet<ItemCategory>();
+                UnknownCategories = new List<string>();
 
                 foreach (var name in Categories)
                 {
@@ -761,6 +1686,10 @@ namespace Oxide.Plugins
                     if (Enum.TryParse(name, true, out parsed))
                     {
                         ParsedCategories.Add(parsed);
+                    }
+                    else
+                    {
+                        UnknownCategories.Add(name);
                     }
                 }
             }
@@ -773,19 +1702,57 @@ namespace Oxide.Plugins
 
         public class PluginConfig
         {
-            public List<string> AllowedContainers { get; set; } = new List<string>
-            {
-                "woodbox_deployed", "box.wooden.large", "small_stash_deployed",
-                "fridge.deployed", "coffinstorage", "campfire", "furnace", "furnace.large"
-            };
+            // Collections stay empty here: Json.NET appends to pre-filled collections on load,
+            // which would duplicate every entry each time the config is read.
+            public List<string> AllowedContainers { get; set; }
+            public List<string> ChatCommands { get; set; }
 
             public float NearbyRadius { get; set; } = 30f;
             public bool RequireBuildingPrivilege { get; set; } = true;
             public bool RespectNoEscape { get; set; } = true;
             public bool IncludeHotbar { get; set; } = false;
             public int SortsPerMinute { get; set; } = 20;
+            public bool LogActions { get; set; } = false;
+            public bool EnableHarness { get; set; } = false;
 
-            public static PluginConfig Default() => new PluginConfig();
+            public UiSettings Ui { get; set; } = new UiSettings();
+
+            public static PluginConfig Default()
+            {
+                return new PluginConfig
+                {
+                    AllowedContainers = new List<string>
+                    {
+                        "woodbox_deployed", "box.wooden.large", "small_stash_deployed",
+                        "fridge.deployed", "coffinstorage", "campfire", "furnace", "furnace.large"
+                    },
+                    ChatCommands = new List<string> { "ps" }
+                };
+            }
+        }
+
+        public class UiSettings
+        {
+            public string AnchorMin { get; set; } = "0.5 0.5";
+            public string AnchorMax { get; set; } = "0.5 0.5";
+            public string MainOffsetMin { get; set; } = "-320 -220";
+            public string MainOffsetMax { get; set; } = "320 220";
+            public string PickerOffsetMin { get; set; } = "-430 -290";
+            public string PickerOffsetMax { get; set; } = "430 290";
+
+            public UiColors Colors { get; set; } = new UiColors();
+        }
+
+        public class UiColors
+        {
+            public string Panel { get; set; } = "0.07 0.07 0.07 0.95";
+            public string Header { get; set; } = "0.15 0.15 0.15 1";
+            public string Button { get; set; } = "0.20 0.35 0.55 0.95";
+            public string Action { get; set; } = "0.20 0.45 0.25 0.95";
+            public string Danger { get; set; } = "0.55 0.20 0.20 0.95";
+            public string Muted { get; set; } = "0.25 0.25 0.25 0.80";
+            public string Selected { get; set; } = "0.20 0.45 0.25 0.95";
+            public string Text { get; set; } = "0.88 0.88 0.88 1";
         }
     }
 }
