@@ -161,3 +161,14 @@ Verified on this machine: server boots to "Server startup complete", plugin load
 Gotcha: `+server.level "Procedural Map"` must reach the process as one quoted argument.
 Windows PowerShell 5.1 `Start-Process -ArgumentList <array>` drops the quotes, splits the value, and the server
 boots with no map and crashes in `NetworkVisibilityGrid`. Pass one pre-quoted argument string, or use the batch file.
+
+Gotcha: `+server.queryport` defaults to `server.port + 1`, which collides with `rcon.port 28016`.
+The query port answers with the Steam A2S protocol, so an RCON client sees a broken HTTP handshake.
+Keep them apart: game 28015, RCON 28016, query 28017, app 28018.
+
+RCON protocol (read from `Facepunch.Rcon.dll`): the password is the WebSocket request path, and frames are JSON.
+Connect to `ws://127.0.0.1:28016/<password>`, send `{"Identifier":1,"Message":"<command>","Name":"dev"}`.
+`tools\rcon.ps1` does this. The first frame back can be a server broadcast, not the command reply.
+
+P2 verified on this machine: `ps.selftest` proves the matcher against the live DB
+(whitelist Weapon minus rockets accepts 110 of 1259 items; rifle.ak True; ammo.rocket.basic False; ammo.rifle False).
