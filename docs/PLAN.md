@@ -155,3 +155,9 @@ UI theme and placement, action logging on/off. All with sane defaults so a fresh
 - Deploy: run `tools\deploy.ps1`. Oxide hot-reloads the plugin file, no restart needed.
 - Verify load: watch `Server.log` for the plugin line, then run `oxide.plugins` or `/ps` in game.
 - Repo: `C:\RustPlugins\PrecisionSorter`, branch `main`, private remote.
+
+Verified on this machine: server boots to "Server startup complete", plugin loads, catalog caches 1259 items, no exceptions.
+
+Gotcha: `+server.level "Procedural Map"` must reach the process as one quoted argument.
+Windows PowerShell 5.1 `Start-Process -ArgumentList <array>` drops the quotes, splits the value, and the server
+boots with no map and crashes in `NetworkVisibilityGrid`. Pass one pre-quoted argument string, or use the batch file.

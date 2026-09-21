@@ -10,13 +10,13 @@ namespace Oxide.Plugins
     [Description("Per-box item and category sorting with a searchable picker UI.")]
     public class PrecisionSorter : RustPlugin
     {
-        private const string UsePerm     = "precisisionsorter.use";
-        private const string NearbyPerm  = "precisisionsorter.nearby";
-        private const string DumpAllPerm = "precisisionsorter.dumpall";
-        private const string LootAllPerm = "precisisionsorter.lootall";
-        private const string ArrangePerm = "precisisionsorter.arrange";
-        private const string AdminPerm   = "precisisionsorter.admin";
-        private const string PanelId     = "precisisionsorter.panel";
+        private const string UsePerm     = "precisionsorter.use";
+        private const string NearbyPerm  = "precisionsorter.nearby";
+        private const string DumpAllPerm = "precisionsorter.dumpall";
+        private const string LootAllPerm = "precisionsorter.lootall";
+        private const string ArrangePerm = "precisionsorter.arrange";
+        private const string AdminPerm   = "precisionsorter.admin";
+        private const string PanelId     = "precisionsorter.panel";
 
         private PluginConfig config;
         private readonly List<ItemDefinition> catalog = new List<ItemDefinition>();
@@ -27,6 +27,11 @@ namespace Oxide.Plugins
         {
             LoadConfig();
             RegisterPermissions();
+        }
+
+        // ItemManager.itemList is empty during Init, so the catalog waits for server init.
+        private void OnServerInitialized()
+        {
             BuildCatalog();
         }
 
@@ -62,6 +67,12 @@ namespace Oxide.Plugins
         private void BuildCatalog()
         {
             catalog.Clear();
+
+            if (ItemManager.itemList == null)
+            {
+                PrintWarning("Item list not ready; catalog empty.");
+                return;
+            }
 
             foreach (var def in ItemManager.itemList)
             {
