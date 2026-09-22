@@ -11,7 +11,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("PrecisionSorter", "gringatestudios", "0.7.0")]
+    [Info("PrecisionSorter", "Basar Ersek", "0.7.0")]
     [Description("Per-box item and category sorting with a searchable picker UI.")]
     public class PrecisionSorter : RustPlugin
     {
@@ -379,8 +379,7 @@ namespace Oxide.Plugins
 
         // ------------------------------------------------------------------ box identity
 
-        // Owner, prefab and exact position survive restarts; net IDs do not.
-        // Invariant culture keeps keys identical on comma-decimal server locales.
+        // Owner, prefab and position survive restarts; net IDs do not. Invariant culture keeps keys stable.
         private static string BuildKey(ulong ownerId, string prefab, Vector3 position)
         {
             return string.Format(CultureInfo.InvariantCulture, "{0}|{1}|{2:F2},{3:F2},{4:F2}",
@@ -423,8 +422,7 @@ namespace Oxide.Plugins
             return filter;
         }
 
-        // Skin never matters: matching uses shortname and category only.
-        // Exclude wins over everything, so "Weapon except rockets" is expressible.
+        // Skin never matters; exclude wins, so "Weapon except rockets" is expressible.
         private static bool Accepts(BoxFilter filter, ItemDefinition def)
         {
             if (filter == null || def == null)
@@ -677,8 +675,7 @@ namespace Oxide.Plugins
             return filter.ParsedCategories.Contains(def.category) ? 1 : 0;
         }
 
-        // Walks the tiers most specific first, nearest box first inside each tier.
-        // A full box fails the move and the next candidate in the same tier is tried.
+        // Most specific tier first, nearest box first; a full box falls through.
         private static bool TryRoute(Item item, List<SortTarget> byDistance)
         {
             for (int tier = 2; tier >= 0; tier--)
@@ -980,10 +977,10 @@ namespace Oxide.Plugins
             }
         }
 
-        // Icon first, translucent button on top, name label last so the state colour stays readable.
+        // Only items with a real sprite get an icon; a bare item id disconnects clients.
         private void AddItemCell(CuiElementContainer cui, BoxFilter filter, ItemDefinition def, float xMin, float xMax, float yMin, float yMax)
         {
-            if (config.Ui.ShowIcons)
+            if (config.Ui.ShowIcons && def.iconSprite != null)
             {
                 cui.Add(new CuiElement
                 {
@@ -992,9 +989,8 @@ namespace Oxide.Plugins
                     {
                         new CuiImageComponent
                         {
-                            ItemId = def.itemid,
+                            Sprite = def.iconSprite.name,
                             Color = "1 1 1 1",
-                            Sprite = "Assets/Content/UI/UI.Background.Tile.psd",
                             Material = "assets/icons/iconmaterial.mat",
                             BlocksRaycast = false
                         },
@@ -1048,7 +1044,7 @@ namespace Oxide.Plugins
             return text.Substring(0, MaxNameLength - 1) + ".";
         }
 
-        // Filtering 1259 items per click is wasted work, so the result is cached per query and category.
+        // Rescanning 1259 items per click is wasted work, so results are cached.
         private List<ItemDefinition> VisibleItems(Session session)
         {
             if (session.CachedItems != null && session.CachedQuery == session.Search && session.CachedBrowse == session.BrowseCategory)
@@ -1862,7 +1858,7 @@ namespace Oxide.Plugins
             PrintWarning("Harness: test filters cleared.");
         }
 
-        // Writes the panel as CUI JSON so the layout can be checked without a game client.
+        // Writes the panel as CUI JSON so layout can be checked headlessly.
         private void DumpUiPreviews()
         {
             var filter = new BoxFilter();
@@ -1939,8 +1935,7 @@ namespace Oxide.Plugins
 
         public class PluginConfig
         {
-            // Collections stay empty here: Json.NET appends to pre-filled collections on load,
-            // which would duplicate every entry each time the config is read.
+            // Collections stay empty here; Json.NET appends to pre-filled lists and duplicates them.
             public List<string> AllowedContainers { get; set; }
             public List<string> ChatCommands { get; set; }
 
@@ -1970,8 +1965,8 @@ namespace Oxide.Plugins
 
         public class UiSettings
         {
-            // Item icons come from the client via the item id, so this needs no extra plugin.
-            public bool ShowIcons { get; set; } = true;
+            // Off by default. Only items with a real sprite get an icon element; see AddItemCell.
+            public bool ShowIcons { get; set; } = false;
 
             // Defaults keep the panel off the centred vanilla loot window.
             public string AnchorMin { get; set; } = "1 0.5";

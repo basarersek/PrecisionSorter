@@ -17,6 +17,7 @@ RustDedicated.exe -batchmode ^
  +rcon.web 1 ^
  +app.port 28018 ^
  +server.saveinterval 300 ^
+ +craft.instant true ^
  -logFile "Server.log"
 
 pause
