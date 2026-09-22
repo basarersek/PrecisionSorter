@@ -24,6 +24,7 @@ namespace Oxide.Plugins
         private const string ArrangePerm = "precisionsorter.arrange";
 
         private const string PanelId  = "precisionsorter.panel";
+        private const string StageId  = "precisionsorter.stage";
         private const string DataFile = "PrecisionSorter/BoxFilters";
 
         private const string TestBoxPrefab = "assets/prefabs/deployable/woodenbox/woodbox_deployed.prefab";
@@ -777,6 +778,7 @@ namespace Oxide.Plugins
         private void CloseUi(BasePlayer player)
         {
             CuiHelper.DestroyUi(player, PanelId);
+            CuiHelper.DestroyUi(player, StageId);
             sessions.Remove(player.userID);
         }
 
@@ -864,11 +866,11 @@ namespace Oxide.Plugins
             AddLabel(cui, PanelId, $"PrecisionSorter - {prefabName}", 0.02f, 0.98f, 0.945f, 1f, 15);
             AddLabel(cui, PanelId, summary, 0.03f, 0.97f, 0.895f, 0.945f, 10);
 
-            AddActionRow(cui);
-            AddSearchRow(cui, session.Search);
-            AddCategoryRow(cui, filter, session.BrowseCategory);
-            AddCategoryAction(cui, filter, session.BrowseCategory);
-            AddItemGrid(cui, filter, visible, session.Page);
+            AddActionRow(cui, PanelId);
+            AddSearchRow(cui, PanelId, session.Search);
+            AddCategoryRow(cui, PanelId, filter, session.BrowseCategory);
+            AddCategoryAction(cui, PanelId, filter, session.BrowseCategory);
+            AddItemGrid(cui, PanelId, filter, visible, session.Page);
 
             AddLabel(cui, PanelId, $"Page {session.Page + 1} / {pageCount}   ({visible.Count} items)", 0.30f, 0.70f, 0.005f, 0.045f, 10);
             AddButton(cui, PanelId, "< Prev", "ps.ui page " + (session.Page - 1), ColorButton, 0.03f, 0.14f, 0.005f, 0.045f, 10);
@@ -879,7 +881,58 @@ namespace Oxide.Plugins
             return cui;
         }
 
-        private void AddActionRow(CuiElementContainer cui)
+        // Temporary bisection aid: sends one UI piece alone so a client fault can be isolated.
+        private void SendStage(BasePlayer player, string stage)
+        {
+            CuiHelper.DestroyUi(player, StageId);
+
+            if (stage == "off")
+            {
+                return;
+            }
+
+            var filter = new BoxFilter();
+            filter.Items.Add("rifle.ak");
+            filter.Categories.Add(ItemCategory.Weapon.ToString());
+            filter.Exclude.Add("ammo.rocket.basic");
+            filter.Rebuild();
+
+            var session = new Session { BrowseCategory = ItemCategory.Weapon.ToString() };
+            var visible = VisibleItems(session);
+
+            var cui = new CuiElementContainer();
+            cui.Add(new CuiPanel
+            {
+                Image = { Color = ColorPanel },
+                RectTransform = { AnchorMin = "0.5 0.5", AnchorMax = "0.5 0.5", OffsetMin = "-400 -300", OffsetMax = "400 300" },
+                CursorEnabled = true,
+                KeyboardEnabled = true
+            }, "Overlay", StageId);
+
+            AddLabel(cui, StageId, $"stage {stage}", 0.02f, 0.98f, 0.94f, 1f, 15);
+            AddButton(cui, StageId, "Close", "ps.ui close", ColorDanger, 0.85f, 0.99f, 0.005f, 0.05f, 10);
+
+            switch (stage)
+            {
+                case "b":
+                    AddSearchRow(cui, StageId, null);
+                    break;
+                case "c":
+                    AddActionRow(cui, StageId);
+                    break;
+                case "d":
+                    AddCategoryRow(cui, StageId, filter, session.BrowseCategory);
+                    AddCategoryAction(cui, StageId, filter, session.BrowseCategory);
+                    break;
+                case "e":
+                    AddItemGrid(cui, StageId, filter, visible, 0);
+                    break;
+            }
+
+            CuiHelper.AddUi(player, cui);
+        }
+
+        private void AddActionRow(CuiElementContainer cui, string parent)
         {
             const float gap = 0.008f;
             float width = (0.94f - gap * 4) / 5f;
@@ -889,15 +942,15 @@ namespace Oxide.Plugins
             for (int i = 0; i < labels.Length; i++)
             {
                 float xMin = 0.03f + i * (width + gap);
-                AddButton(cui, PanelId, labels[i], commands[i], i == 0 ? ColorAction : ColorButton, xMin, xMin + width, 0.80f, 0.875f, 11);
+                AddButton(cui, parent, labels[i], commands[i], i == 0 ? ColorAction : ColorButton, xMin, xMin + width, 0.80f, 0.875f, 11);
             }
         }
 
-        private void AddSearchRow(CuiElementContainer cui, string query)
+        private void AddSearchRow(CuiElementContainer cui, string parent, string query)
         {
             cui.Add(new CuiElement
             {
-                Parent = PanelId,
+                Parent = parent,
                 Components =
                 {
                     new CuiImageComponent { Color = "0.16 0.16 0.16 1" },
@@ -915,12 +968,12 @@ namespace Oxide.Plugins
                 }
             });
 
-            AddButton(cui, PanelId, "Clear search", "ps.ui search", ColorMuted, 0.635f, 0.80f, 0.715f, 0.785f, 10);
-            AddButton(cui, PanelId, "Clear filter", "ps.ui clear", ColorDanger, 0.815f, 0.97f, 0.715f, 0.785f, 10);
+            AddButton(cui, parent, "Clear search", "ps.ui search", ColorMuted, 0.635f, 0.80f, 0.715f, 0.785f, 10);
+            AddButton(cui, parent, "Clear filter", "ps.ui clear", ColorDanger, 0.815f, 0.97f, 0.715f, 0.785f, 10);
         }
 
         // Category buttons only browse the grid; assigning a whole category is a separate action.
-        private void AddCategoryRow(CuiElementContainer cui, BoxFilter filter, string browsing)
+        private void AddCategoryRow(CuiElementContainer cui, string parent, BoxFilter filter, string browsing)
         {
             const int perRow = 7;
             const float width = 0.94f / perRow;
@@ -935,26 +988,26 @@ namespace Oxide.Plugins
                 bool active = browsing == name;
                 string color = active ? ColorButton : (filter.Categories.Contains(name) ? ColorSelected : ColorMuted);
 
-                AddButton(cui, PanelId, name, "ps.ui browse " + name, color, xMin, xMin + width - 0.008f, yMax - 0.065f, yMax, 9);
+                AddButton(cui, parent, name, "ps.ui browse " + name, color, xMin, xMin + width - 0.008f, yMax - 0.065f, yMax, 9);
             }
         }
 
-        private void AddCategoryAction(CuiElementContainer cui, BoxFilter filter, string browsing)
+        private void AddCategoryAction(CuiElementContainer cui, string parent, BoxFilter filter, string browsing)
         {
             if (string.IsNullOrEmpty(browsing))
             {
-                AddButton(cui, PanelId, "Showing every category - click one above to narrow the list", "ps.ui browse", ColorMuted, 0.03f, 0.97f, 0.49f, 0.55f, 10);
+                AddButton(cui, parent, "Showing every category - click one above to narrow the list", "ps.ui browse", ColorMuted, 0.03f, 0.97f, 0.49f, 0.55f, 10);
                 return;
             }
 
             bool assigned = filter.Categories.Contains(browsing);
             string label = (assigned ? "Remove whole category: " : "Accept whole category: ") + browsing;
 
-            AddButton(cui, PanelId, label, "ps.ui accept", assigned ? ColorDanger : ColorAction, 0.03f, 0.62f, 0.49f, 0.55f, 10);
-            AddButton(cui, PanelId, "Show all", "ps.ui browse", ColorMuted, 0.64f, 0.97f, 0.49f, 0.55f, 10);
+            AddButton(cui, parent, label, "ps.ui accept", assigned ? ColorDanger : ColorAction, 0.03f, 0.62f, 0.49f, 0.55f, 10);
+            AddButton(cui, parent, "Show all", "ps.ui browse", ColorMuted, 0.64f, 0.97f, 0.49f, 0.55f, 10);
         }
 
-        private void AddItemGrid(CuiElementContainer cui, BoxFilter filter, List<ItemDefinition> visible, int currentPage)
+        private void AddItemGrid(CuiElementContainer cui, string parent, BoxFilter filter, List<ItemDefinition> visible, int currentPage)
         {
             const float width = 0.94f / GridColumns;
             int start = currentPage * PageSize;
@@ -973,18 +1026,18 @@ namespace Oxide.Plugins
                 float xMin = 0.03f + column * width;
                 float yMax = 0.475f - row * 0.105f;
 
-                AddItemCell(cui, filter, def, xMin, xMin + width - 0.006f, yMax - 0.095f, yMax);
+                AddItemCell(cui, parent, filter, def, xMin, xMin + width - 0.006f, yMax - 0.095f, yMax);
             }
         }
 
         // Only items with a real sprite get an icon; a bare item id disconnects clients.
-        private void AddItemCell(CuiElementContainer cui, BoxFilter filter, ItemDefinition def, float xMin, float xMax, float yMin, float yMax)
+        private void AddItemCell(CuiElementContainer cui, string parent, BoxFilter filter, ItemDefinition def, float xMin, float xMax, float yMin, float yMax)
         {
             if (config.Ui.ShowIcons && def.iconSprite != null)
             {
                 cui.Add(new CuiElement
                 {
-                    Parent = PanelId,
+                    Parent = parent,
                     Components =
                     {
                         new CuiImageComponent
@@ -1004,13 +1057,13 @@ namespace Oxide.Plugins
                 Button = { Command = "ps.ui item " + def.shortname, Color = StateOverlay(filter, def) },
                 Text = { Text = string.Empty, FontSize = 1 },
                 RectTransform = { AnchorMin = Anchor(xMin, yMin), AnchorMax = Anchor(xMax, yMax) }
-            }, PanelId);
+            }, parent);
 
             cui.Add(new CuiLabel
             {
                 Text = { Text = Shorten(def.displayName.english), FontSize = 9, Align = TextAnchor.MiddleCenter, Color = StateColor(filter, def), BlocksRaycast = false },
                 RectTransform = { AnchorMin = Anchor(xMin, yMin), AnchorMax = Anchor(xMax, yMin + 0.026f) }
-            }, PanelId);
+            }, parent);
         }
 
         // Untouched, accepted and excluded each get their own tint.
@@ -1389,6 +1442,12 @@ namespace Oxide.Plugins
             if (verb == "find")
             {
                 FindItems(player, args.Length > 1 ? args[1] : null);
+                return;
+            }
+
+            if (verb == "test")
+            {
+                SendStage(player, args.Length > 1 ? args[1] : "a");
                 return;
             }
 
