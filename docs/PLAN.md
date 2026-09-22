@@ -164,20 +164,28 @@ each entry.
 - T3 persistence - automated. `ps.harness save` writes a filter, the server restarts, then
   `ps.harness check` reads it back. PASSING.
 - T4 gating matrix - needs a client for the chat path. Permission, privilege, raid block and cooldown refusals.
+- T4b UI geometry - automated. `ps.harness ui` writes both panels as CUI JSON and `tools\validate-ui.ps1`
+  checks anchor ranges, rect sanity, button commands and the input field keyboard flag.
+  PASSING: main 19 elements / 7 buttons, picker 108 elements / 51 buttons.
 - T5 single client - manual. Panel scope, search field, cursor and keyboard, icon rendering, each action.
 - T6 concurrency - manual, two clients. Simultaneous sorts on one box, moves during a sort, adjacent boxes.
 - T7 load - timing a Nearby sort with many boxes, then a soak.
-- T8 update regression - re-run T0 to T3 after every Facepunch and Oxide update.
+- T8 update regression - re-run T0 to T4b after every Facepunch and Oxide update.
 
 100% is not attainable: Facepunch can change item data every month, and dupe or UI faults only appear
-with a real client. T2 and T3 are the mechanical guard; T5 and T6 are yours.
+with a real client. T2, T3 and T4b are the mechanical guard; T5 and T6 are yours.
+
+What the automated checks cannot see: whether the panel covers the loot window, whether the search field
+takes typing, whether the cursor locks, whether text overflows its button, and whether the player perceives
+items as vanishing.
 
 ## 15. Risks and open questions
 
 - CUI input fields behave differently across client resolutions; needs a real client test.
-- `IItemContainerEntity` and `MoveToContainer` signatures are confirmed by compile on the dev server, not yet by reflection (PS 5.1 cannot reflect default-interface types).
-- NoEscape API surface varies by version; the soft-dependency wrapper isolates that.
-- Stashes and small boxes share the same prefab family; verify the allowed-list defaults on a live wipe.
+- Item icons: only 55 of 1259 items expose an `iconSprite`, so sprite-name icons cannot cover the grid.
+  `Ui.ShowIcons` is off by default. Real icons need ImageLibrary or a bundled atlas.
+- Panel placement default is bottom-left, chosen to avoid the centred vanilla loot window. Needs a live look.
+- NoEscape API surface varies by version; the soft-dependency wrapper tries four hook names and treats any true as blocked.
 
 ## 15. Dev workflow
 

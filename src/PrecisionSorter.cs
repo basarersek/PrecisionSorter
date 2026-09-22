@@ -11,7 +11,7 @@ using UnityEngine;
 
 namespace Oxide.Plugins
 {
-    [Info("PrecisionSorter", "gringatestudios", "0.5.0")]
+    [Info("PrecisionSorter", "gringatestudios", "0.6.0")]
     [Description("Per-box item and category sorting with a searchable picker UI.")]
     public class PrecisionSorter : RustPlugin
     {
@@ -754,6 +754,9 @@ namespace Oxide.Plugins
 
             if (!TryGetOpenBox(player, out session, out entity, out container))
             {
+                // A destroyed box would otherwise leave the player stuck with a dead panel.
+                CuiHelper.DestroyUi(player, PanelId);
+                sessions.Remove(player.userID);
                 return;
             }
 
@@ -774,11 +777,11 @@ namespace Oxide.Plugins
             return string.Format(CultureInfo.InvariantCulture, "{0:0.####} {1:0.####}", x, y);
         }
 
-        private void AddButton(CuiElementContainer cui, string parent, string text, string command, string color, float xMin, float xMax, float yMin, float yMax, int fontSize = 12)
+        private void AddButton(CuiElementContainer cui, string parent, string text, string command, string color, float xMin, float xMax, float yMin, float yMax, int fontSize = 12, Sprite sprite = null)
         {
             cui.Add(new CuiButton
             {
-                Button = { Command = command, Color = color },
+                Button = { Command = command, Color = color, Sprite = sprite != null ? sprite.name : null },
                 Text = { Text = text, FontSize = fontSize, Align = TextAnchor.MiddleCenter, Color = ColorText },
                 RectTransform = { AnchorMin = Anchor(xMin, yMin), AnchorMax = Anchor(xMax, yMax) }
             }, parent);
@@ -793,7 +796,7 @@ namespace Oxide.Plugins
             }, parent);
         }
 
-        private CuiElementContainer NewPanel(string name, string offsetMin, string offsetMax, bool keyboard)
+        private CuiElementContainer NewPanel(string name, string anchorMin, string anchorMax, string offsetMin, string offsetMax, bool keyboard)
         {
             var cui = new CuiElementContainer();
             cui.Add(new CuiPanel
@@ -801,8 +804,8 @@ namespace Oxide.Plugins
                 Image = { Color = ColorPanel },
                 RectTransform =
                 {
-                    AnchorMin = config.Ui.AnchorMin,
-                    AnchorMax = config.Ui.AnchorMax,
+                    AnchorMin = anchorMin,
+                    AnchorMax = anchorMax,
                     OffsetMin = offsetMin,
                     OffsetMax = offsetMax
                 },
@@ -819,18 +822,16 @@ namespace Oxide.Plugins
             return cui;
         }
 
-        private void ShowMain(BasePlayer player, Session session, BaseEntity entity)
+        // Builders are player-free so the harness can render and validate them without a client.
+        private CuiElementContainer BuildMain(string prefabName, BoxFilter filter)
         {
-            CuiHelper.DestroyUi(player, PanelId);
-
-            var filter = GetFilter(FilterOwner(entity, player), entity);
             var summary = filter == null
                 ? "No filter set - open Filter to choose items"
                 : $"{filter.Mode} | {filter.Items.Count} items | {filter.Categories.Count} categories | {filter.Exclude.Count} excluded";
 
-            var cui = NewPanel(PanelId, config.Ui.MainOffsetMin, config.Ui.MainOffsetMax, false);
+            var cui = NewPanel(PanelId, config.Ui.MainAnchorMin, config.Ui.MainAnchorMax, config.Ui.MainOffsetMin, config.Ui.MainOffsetMax, false);
 
-            AddLabel(cui, PanelId, $"PrecisionSorter - {entity.ShortPrefabName}", 0.02f, 0.98f, 0.90f, 0.99f, 15);
+            AddLabel(cui, PanelId, $"PrecisionSorter - {prefabName}", 0.02f, 0.98f, 0.90f, 0.99f, 15);
             AddLabel(cui, PanelId, summary, 0.03f, 0.97f, 0.79f, 0.88f, 11);
 
             AddButton(cui, PanelId, "This", "ps.run this", ColorAction, 0.04f, 0.32f, 0.62f, 0.74f);
@@ -844,21 +845,21 @@ namespace Oxide.Plugins
             AddLabel(cui, PanelId, "This moves matching items in. Nearby spreads them across your boxes. Arrange reorders the box.", 0.04f, 0.96f, 0.28f, 0.38f, 10);
             AddButton(cui, PanelId, "Close", "ps.ui close", ColorDanger, 0.36f, 0.64f, 0.08f, 0.20f);
 
-            CuiHelper.AddUi(player, cui);
+            return cui;
         }
 
-        private void ShowPicker(BasePlayer player, Session session, BaseEntity entity)
+        private void ShowMain(BasePlayer player, Session session, BaseEntity entity)
         {
             CuiHelper.DestroyUi(player, PanelId);
+            CuiHelper.AddUi(player, BuildMain(entity.ShortPrefabName, GetFilter(FilterOwner(entity, player), entity)));
+        }
 
-            var filter = EnsureFilter(FilterOwner(entity, player), entity);
-            var visible = VisibleItems(session);
-            int pageCount = Math.Max(1, (visible.Count + PageSize - 1) / PageSize);
-            session.Page = Math.Min(Math.Max(session.Page, 0), pageCount - 1);
+        // Builders are player-free so the harness can render and validate them without a client.
+        private CuiElementContainer BuildPicker(BoxFilter filter, List<ItemDefinition> visible, int currentPage, int pageCount, string query)
+        {
+            var cui = NewPanel(PanelId, config.Ui.PickerAnchorMin, config.Ui.PickerAnchorMax, config.Ui.PickerOffsetMin, config.Ui.PickerOffsetMax, true);
 
-            var cui = NewPanel(PanelId, config.Ui.PickerOffsetMin, config.Ui.PickerOffsetMax, true);
-
-            AddLabel(cui, PanelId, $"{entity.ShortPrefabName} filter - {filter.Mode}", 0.02f, 0.98f, 0.91f, 0.99f, 15);
+            AddLabel(cui, PanelId, $"Filter - {filter.Mode}", 0.02f, 0.98f, 0.91f, 0.99f, 15);
 
             cui.Add(new CuiElement
             {
@@ -870,7 +871,7 @@ namespace Oxide.Plugins
                     new CuiInputFieldComponent
                     {
                         Command = "ps.ui search",
-                        Text = session.Search ?? string.Empty,
+                        Text = query ?? string.Empty,
                         FontSize = 12,
                         Align = TextAnchor.MiddleLeft,
                         Color = ColorText,
@@ -880,21 +881,33 @@ namespace Oxide.Plugins
                 }
             });
 
-            AddLabel(cui, PanelId, "Type and press Enter to search", 0.02f, 0.60f, 0.80f, 0.84f, 9, TextAnchor.MiddleLeft);
-            AddButton(cui, PanelId, "Clear search", "ps.ui search", ColorMuted, 0.62f, 0.76f, 0.84f, 0.90f, 10);
-            AddButton(cui, PanelId, "Clear filter", "ps.ui clear", ColorDanger, 0.78f, 0.98f, 0.84f, 0.90f, 10);
+            AddLabel(cui, PanelId, "Type and press Enter to search. Click an item: green = accept, red = exclude.", 0.02f, 0.76f, 0.80f, 0.84f, 9, TextAnchor.MiddleLeft);
+            AddButton(cui, PanelId, "Clear search", "ps.ui search", ColorMuted, 0.78f, 0.88f, 0.84f, 0.90f, 10);
+            AddButton(cui, PanelId, "Clear filter", "ps.ui clear", ColorDanger, 0.89f, 0.99f, 0.84f, 0.90f, 10);
 
             AddCategoryRow(cui, filter);
-            AddItemGrid(cui, filter, visible, session.Page);
+            AddItemGrid(cui, filter, visible, currentPage);
 
-            AddLabel(cui, PanelId, $"Page {session.Page + 1} / {pageCount}   ({visible.Count} items)", 0.30f, 0.70f, 0.02f, 0.07f, 10);
-            AddButton(cui, PanelId, "< Prev", "ps.ui page " + (session.Page - 1), ColorButton, 0.03f, 0.15f, 0.02f, 0.07f, 10);
-            AddButton(cui, PanelId, "Next >", "ps.ui page " + (session.Page + 1), ColorButton, 0.85f, 0.97f, 0.02f, 0.07f, 10);
+            AddLabel(cui, PanelId, $"Page {currentPage + 1} / {pageCount}   ({visible.Count} items)", 0.30f, 0.70f, 0.02f, 0.07f, 10);
+            AddButton(cui, PanelId, "< Prev", "ps.ui page " + (currentPage - 1), ColorButton, 0.03f, 0.15f, 0.02f, 0.07f, 10);
+            AddButton(cui, PanelId, "Next >", "ps.ui page " + (currentPage + 1), ColorButton, 0.85f, 0.97f, 0.02f, 0.07f, 10);
             AddButton(cui, PanelId, "Mode: " + filter.Mode, "ps.ui mode", ColorButton, 0.17f, 0.29f, 0.02f, 0.07f, 10);
             AddButton(cui, PanelId, "Back", "ps.ui back", ColorAction, 0.42f, 0.58f, 0.02f, 0.07f, 10);
             AddButton(cui, PanelId, "Close", "ps.ui close", ColorDanger, 0.71f, 0.83f, 0.02f, 0.07f, 10);
 
-            CuiHelper.AddUi(player, cui);
+            return cui;
+        }
+
+        private void ShowPicker(BasePlayer player, Session session, BaseEntity entity)
+        {
+            CuiHelper.DestroyUi(player, PanelId);
+
+            var filter = EnsureFilter(FilterOwner(entity, player), entity);
+            var visible = VisibleItems(session);
+            int pageCount = Math.Max(1, (visible.Count + PageSize - 1) / PageSize);
+            session.Page = Math.Min(Math.Max(session.Page, 0), pageCount - 1);
+
+            CuiHelper.AddUi(player, BuildPicker(filter, visible, session.Page, pageCount, session.Search));
         }
 
         private void AddCategoryRow(CuiElementContainer cui, BoxFilter filter)
@@ -933,11 +946,22 @@ namespace Oxide.Plugins
                 int column = i % GridColumns;
                 float xMin = 0.03f + column * width;
                 float yMax = 0.60f - row * 0.062f;
-                bool on = filter.Items.Contains(def.shortname);
 
                 AddButton(cui, PanelId, Shorten(def.displayName.english), "ps.ui item " + def.shortname,
-                    on ? ColorSelected : ColorMuted, xMin, xMin + width - 0.006f, yMax - 0.055f, yMax, 9);
+                    StateColor(filter, def), xMin, xMin + width - 0.006f, yMax - 0.055f, yMax, 9,
+                    config.Ui.ShowIcons ? def.iconSprite : null);
             }
+        }
+
+        // Three states per item: accepted, excluded, untouched.
+        private string StateColor(BoxFilter filter, ItemDefinition def)
+        {
+            if (filter.Exclude.Contains(def.shortname))
+            {
+                return ColorDanger;
+            }
+
+            return filter.Items.Contains(def.shortname) ? ColorSelected : ColorMuted;
         }
 
         private static string Shorten(string text)
@@ -1130,7 +1154,12 @@ namespace Oxide.Plugins
 
             var filter = EnsureFilter(FilterOwner(entity, player), entity);
 
-            if (!filter.Items.Remove(shortname))
+            // Cycles accept -> exclude -> untouched, so the picker needs no chat command.
+            if (filter.Items.Remove(shortname))
+            {
+                filter.Exclude.Add(shortname);
+            }
+            else if (!filter.Exclude.Remove(shortname))
             {
                 filter.Items.Add(shortname);
             }
@@ -1381,6 +1410,9 @@ namespace Oxide.Plugins
             PrintWarning(deadItems.Count == 0
                 ? "Selftest: every saved item shortname still exists in the game."
                 : "Selftest: saved items missing from the game: " + string.Join(", ", deadItems));
+
+            int withIcons = catalog.Count(def => def.iconSprite != null);
+            PrintWarning($"Selftest: {withIcons} of {catalog.Count} items expose an icon sprite.");
         }
 
         private ItemDefinition Find(string shortname)
@@ -1421,8 +1453,11 @@ namespace Oxide.Plugins
                 case "clear":
                     HarnessClear();
                     break;
+                case "ui":
+                    DumpUiPreviews();
+                    break;
                 default:
-                    PrintWarning("Usage: ps.harness run [n] | save | check | clear");
+                    PrintWarning("Usage: ps.harness run [n] | save | check | clear | ui");
                     break;
             }
         }
@@ -1651,6 +1686,28 @@ namespace Oxide.Plugins
             PrintWarning("Harness: test filters cleared.");
         }
 
+        // Writes both panels as CUI JSON so the layout can be checked without a game client.
+        private void DumpUiPreviews()
+        {
+            var filter = new BoxFilter();
+            filter.Categories.Add(ItemCategory.Weapon.ToString());
+            filter.Categories.Add(ItemCategory.Medical.ToString());
+            filter.Items.Add("rifle.ak");
+            filter.Exclude.Add("ammo.rocket.basic");
+            filter.Rebuild();
+
+            var visible = catalog.Take(PageSize + 3).ToList();
+            int pageCount = Math.Max(1, (visible.Count + PageSize - 1) / PageSize);
+
+            var directory = Path.Combine(Interface.Oxide.DataDirectory, "PrecisionSorter");
+            Directory.CreateDirectory(directory);
+
+            File.WriteAllText(Path.Combine(directory, "ui-main.json"), BuildMain("woodbox_deployed", filter).ToJson());
+            File.WriteAllText(Path.Combine(directory, "ui-picker.json"), BuildPicker(filter, visible, 0, pageCount, null).ToJson());
+
+            PrintWarning($"Harness: wrote UI previews to {directory}.");
+        }
+
         // ------------------------------------------------------------------ serialized models
 
         [JsonConverter(typeof(StringEnumConverter))]
@@ -1733,10 +1790,17 @@ namespace Oxide.Plugins
 
         public class UiSettings
         {
-            public string AnchorMin { get; set; } = "0.5 0.5";
-            public string AnchorMax { get; set; } = "0.5 0.5";
-            public string MainOffsetMin { get; set; } = "-320 -220";
-            public string MainOffsetMax { get; set; } = "320 220";
+            // Off by default: sprite names render differently per client and need a live check.
+            public bool ShowIcons { get; set; } = false;
+
+            // Defaults keep the main panel clear of the vanilla loot window, which sits centred.
+            public string MainAnchorMin { get; set; } = "0 0";
+            public string MainAnchorMax { get; set; } = "0 0";
+            public string MainOffsetMin { get; set; } = "20 20";
+            public string MainOffsetMax { get; set; } = "660 460";
+
+            public string PickerAnchorMin { get; set; } = "0.5 0.5";
+            public string PickerAnchorMax { get; set; } = "0.5 0.5";
             public string PickerOffsetMin { get; set; } = "-430 -290";
             public string PickerOffsetMax { get; set; } = "430 290";
 
