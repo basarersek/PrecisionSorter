@@ -22,7 +22,6 @@ namespace Oxide.Plugins
         private const string DumpAllPerm = "precisionsorter.dumpall";
         private const string LootAllPerm = "precisionsorter.lootall";
         private const string ArrangePerm = "precisionsorter.arrange";
-        private const string AdminPerm   = "precisionsorter.admin";
 
         private const string PanelId  = "precisionsorter.panel";
         private const string DataFile = "PrecisionSorter/BoxFilters";
@@ -259,7 +258,6 @@ namespace Oxide.Plugins
             permission.RegisterPermission(DumpAllPerm, this);
             permission.RegisterPermission(LootAllPerm, this);
             permission.RegisterPermission(ArrangePerm, this);
-            permission.RegisterPermission(AdminPerm, this);
         }
 
         // Caches every real item once so no per-open scan of the item DB is needed.
