@@ -74,29 +74,48 @@ Each box holds one filter:
 This gives exactly the requested behavior: select `Assault Rifle` -> every skin qualifies. Select `LR300` -> only LR300.
 Select `Ammunition` then remove rockets -> rockets out.
 
-## 7. Actions (same names as AbsolutSorter)
+## 7. Actions
 
-- This: move accepted items from the player inventory into the open box.
-- Nearby: for each accepted inventory item, route it to the nearest authorized box within radius whose filter accepts it. Spreads across the base.
+- This: move accepted items from the player inventory into the open box only. If it is full, items stay put.
+- Nearby: route each inventory item to the best box in radius. See the routing rule below.
 - Arrange: reorder box contents so accepted items come first (by name), the rest after (by name).
-- Dump All: move the whole inventory into the box, ignoring the filter.
-- Loot All: move the box contents into the player inventory.
+- Dump All: move the whole inventory into the open box, ignoring the filter.
+- Loot All: move the open box contents into the player inventory.
+
+### Routing rule (Nearby)
+
+1. Collect every reachable box in radius whose filter accepts the item.
+2. Rank by specificity: a box listing **this exact item** (2) beats a box listing only its **category** (1).
+   A blacklist box is the least specific (0).
+3. Inside a tier, the **nearest** box to the player wins.
+4. If the chosen box is full, the next candidate in the same tier is tried, then the lower tiers.
+5. An item no box accepts stays in the inventory. Nothing is ever dropped.
+
+So a full "Assault Rifle" box sends the rifle to the nearest "Weapon" box.
+
+Reachable means: the box is the player's own, or the player is authorized on the cupboard covering it.
+Teammate and clanmate boxes qualify through that cupboard check.
 
 Gating: `RequireBuildingPrivilege` for This/Nearby/Arrange. `RespectNoEscape` blocks all actions while raid blocked,
 using the NoEscape API when that plugin is loaded (detected via `Interface.Oxide`, optional soft dependency).
 
 ## 8. UI
 
-Replace the cramped corner panel with a proper overlay:
-- Header with box name and mode toggle.
-- Search field at the top (CUI input field) that filters the item grid live by display name.
-- Category row: one button per real category, with friendly labels and item counts.
-- Item grid: icon + name, click toggles membership. Selected items listed separately for quick review.
-- Action bar: This / Nearby / Arrange / Dump All / Loot All, each permission-gated and dimmed when unavailable.
-- Apply and Clear.
+One panel, no page switch. Search, category browsing and the item grid sit on the same screen as the actions.
 
-Cursor handling is explicit (`CursorEnabled`, keyboard capture for the search field) so looting never soft-locks the player.
-Icons: prefer the game's own item sprites; fall back to a bundled icon sheet if sprite access is unreliable, decided in P1.
+- Header: box name and a live summary of the filter.
+- Action row: This, Nearby, Arrange, Dump All, Loot All.
+- Search field: filters the grid by display name. Applied on Enter.
+- Category row: clicking a category **narrows the grid only**, it never changes the box.
+  Green means the category is assigned to the box, blue means it is the active browse filter.
+- Category action: "Accept whole category: Weapon" assigns or removes the browsed category.
+- Item grid: 6 by 4 cells. Each cell shows the real Rust item icon (client-rendered from the item id,
+  so no ImageLibrary dependency) plus the item name.
+  Clicking cycles the state: green tint = accepted, red tint = excluded, plain = untouched.
+- Footer: paging, whitelist/blacklist toggle, close.
+
+Cursor and keyboard are enabled explicitly so the search field works and looting never soft-locks.
+
 
 ## 9. Performance for 500-1000 players
 

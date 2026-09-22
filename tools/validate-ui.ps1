@@ -27,8 +27,9 @@ function Get-Pair([string]$value) {
 
 $problems = New-Object System.Collections.Generic.List[string]
 
-foreach ($file in @('ui-main.json', 'ui-picker.json')) {
-    $path = Join-Path $Directory $file
+foreach ($item in (Get-ChildItem -LiteralPath $Directory -Filter 'ui-*.json' -ErrorAction SilentlyContinue | Sort-Object Name)) {
+    $file = $item.Name
+    $path = $item.FullName
     if (-not (Test-Path -LiteralPath $path)) {
         $problems.Add("$file : MISSING")
         continue
